@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import sklearn.feature_selection
 
 class SimpleRecurrentPredictor(nn.Module):
   def __init__(
@@ -84,17 +85,11 @@ class RecurrentVariationalPredictor(nn.Module):
     self.hidden_dim = hidden_dim
     self.max_num_ticks = max_num_ticks
 
-    # Recurrent cell that processes each time step.
     self.rnn_cell = nn.LSTMCell(input_dim, hidden_dim)
-
-    # Inference network: from hidden state, infer latent parameters.
     self.fc_mu = nn.Linear(hidden_dim, latent_dim)
     self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
-
-    # Prediction network: from [hidden state, zₜ] predict distribution over yₜ.
-    self.fc_pred = nn.Linear(hidden_dim + latent_dim, output_dim)
-
-    # Adaptive computation time network
+    # self.fc_pred = nn.Linear(hidden_dim + latent_dim, output_dim)
+    self.fc_pred = nn.Linear(latent_dim, output_dim)
     self.fc_halt = nn.Linear(hidden_dim + latent_dim, 1)
   
   def reparameterize(self, mu, logvar):
@@ -140,13 +135,17 @@ class RecurrentVariationalPredictor(nn.Module):
         mu_t = self.fc_mu(hx)
         logvar_t = self.fc_logvar(hx)
         z_t = self.reparameterize(mu_t, logvar_t)
+
+        # print('tick: ', num_ticks, torch.mean(torch.mean(logvar_t.exp(), dim=0)))
+        # print('tick: ', num_ticks, torch.mean(torch.mean(mu_t, dim=0)))
         
         # Combine hidden state and latent sample for target prediction.
-        combined = torch.cat([hx, z_t], dim=1)
-        logits_t = self.fc_pred(combined)
+        # pred = torch.cat([hx, z_t], dim=1)
+        pred = z_t.clone()
+        logits_t = self.fc_pred(pred)
 
         # # Halt
-        # halt = torch.sigmoid(self.fc_halt(combined))
+        # halt = torch.sigmoid(self.fc_halt(pred))
         mask = not_finished[:, None].detach()
         mask = mask * sm[:, t, :]
 
@@ -205,24 +204,41 @@ def variational_loss(logits_seq, targets, mu_seq, logvar_seq, ok, beta=1.0):
   
   # KL divergence term (against standard normal) per time step.
   kl_div = -0.5 * torch.sum(1 + logvar_seq - mu_seq.pow(2) - logvar_seq.exp())
+  mu_kl_div = kl_div/num_ok
+
+  outs = {'kl_divergence': mu_kl_div}
   
-  return ce_loss/num_ok + beta * kl_div/num_ok
+  return ce_loss/num_ok + beta * mu_kl_div, outs
 
 def variational_forward(model: RecurrentVariationalPredictor, loss_fn, x_seq, y_seq, mask, **kwargs):
-  logits_seq, mu_seq, logvar_seq, _, dst_seq, ok = model(x_seq, y_seq, mask, **kwargs)
-  loss = loss_fn((logits_seq, dst_seq, mu_seq, logvar_seq, ok))
+  logits_seq, mu_seq, logvar_seq, z_seq, dst_seq, ok = model(x_seq, y_seq, mask, **kwargs)
+
+  outs = {}
+  if True:
+    with torch.no_grad():
+      zf, tf = reshape_outputs(z_seq, dst_seq, ok)
+      mi = sklearn.feature_selection.mutual_info_classif(zf.cpu().numpy(), tf.cpu().numpy())
+      outs['mutual_information'] = mi
+
+  loss, loss_outs = loss_fn((logits_seq, dst_seq, mu_seq, logvar_seq, ok))
   acc = accuracy(logits_seq, dst_seq, ok)
-  return loss, acc
+
+  outs.update(loss_outs)
+
+  return loss, acc, outs
 
 def simple_loss(logits_seq, targets, ok):
   batch_size, seq_len, output_dim = logits_seq.size()
   num_ok = ok.sum()
   lf, tf = reshape_outputs(logits_seq, targets, ok)
   ce_loss = F.cross_entropy(lf, tf, reduction='sum')
-  return ce_loss/num_ok
+  outs = {}
+  return ce_loss/num_ok, outs
 
 def simple_forward(model: SimpleRecurrentPredictor, loss_fn, x_seq, y_seq, mask, **kwargs):
   logits_seq, dst_seq, ok = model(x_seq, y_seq, mask, **kwargs)
-  loss = loss_fn((logits_seq, dst_seq, ok))
+  loss, loss_outs = loss_fn((logits_seq, dst_seq, ok))
   acc = accuracy(logits_seq, dst_seq, ok)
-  return loss, acc
+  outs = {}
+  outs.update(loss_outs)
+  return loss, acc, outs

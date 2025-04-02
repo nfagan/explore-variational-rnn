@@ -12,13 +12,17 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from matplotlib import pyplot as plt
-from typing import Tuple
+from typing import Tuple, List
 from dataclasses import dataclass
-import os
+import os, re
 
-# CP_PREFIX = 'variational-high-beta'
-# CP_PREFIX = 'variational'
-CP_PREFIX = 'simple'
+# CP_PREFIX = 'variational-beta_2'  # 3 ticks
+# CP_PREFIX = 'variational-high-beta'   # beta = 8, 3 ticks
+# CP_PREFIX = 'variational-beta_0.1_5_ticks'      
+# CP_PREFIX = 'variational-beta_0.1_4_ticks'
+CP_PREFIX = 'variational-beta_0.1_2_ticks'
+# CP_PREFIX = 'variational-low-beta'      # beta = 0.1, 3 ticks
+# CP_PREFIX = 'simple-large-logic'
 
 @dataclass
 class PlotContext:
@@ -35,6 +39,7 @@ class PlotContext:
 @dataclass
 class TrainContext:
   save_checkpoints: bool
+  root_p: str
 
 class LogicDataset(Dataset):
   def __init__(self, batch_size: int, seq_len: int, num_ops: int, num_samples: int = None):
@@ -97,19 +102,39 @@ class ParityDataset(Dataset):
 def eval_model(model, forward_fn, loss_fn, data_loader):
   model.eval()
   total_loss = total_acc = 0.0
+  total_outs = []
   ns = 0
   for x_seq, y_seq, mask in data_loader:
-    loss, acc = forward_fn((model, loss_fn, x_seq, y_seq, mask))
+    loss, acc, outs = forward_fn((model, loss_fn, x_seq, y_seq, mask))
     total_loss += loss.item()
     total_acc += acc.item()
+    total_outs.append(outs)
     ns += 1
   avg_loss = total_loss / ns
   avg_acc = total_acc / ns
   print(f'(Eval): Loss: {avg_loss:.4f} | Acc: {avg_acc:.2f}')
-  return avg_loss, avg_acc
+  return avg_loss, avg_acc, total_outs
 
-def cp_fname(epoch: int):
-  root_p = os.getcwd()
+def cp_epochs(root_p: str) -> List[str]:
+  def find_and_extract(directory: str, substring: str):
+    results = []
+    # Compile regex to capture the last integer before the ".pth" extension.
+    pattern = re.compile(r'(\d+)(?=\.pth$)')
+    
+    # Loop over files in the directory.
+    for filename in os.listdir(directory):
+      if filename.endswith('.pth') and substring in filename:
+        match = pattern.search(filename)
+        if match:
+          number = int(match.group(1))
+          results.append((filename, number))
+    return results
+  res = find_and_extract(os.path.join(root_p, 'checkpoints'), CP_PREFIX)
+  res = sorted(res, key=lambda x: x[1])
+  res = [v[1] for v in res]
+  return res
+
+def cp_fname(root_p: str, epoch: int):
   return os.path.join(root_p, 'checkpoints', f'cp-{CP_PREFIX}-{epoch}.pth')
 
 def train_model(
@@ -126,7 +151,7 @@ def train_model(
     ns = 0
     for x_seq, y_seq, mask in train_data:
       optimizer.zero_grad()
-      loss, acc = train_forward_fn((model, loss_fn, x_seq, y_seq, mask))
+      loss, acc, _ = train_forward_fn((model, loss_fn, x_seq, y_seq, mask))
       loss.backward()
       optimizer.step()
       total_loss += loss.item()
@@ -144,29 +169,46 @@ def train_model(
       eval_model(model, eval_forward_fn, loss_fn, eval_data)
       if context.save_checkpoints:
         sd = {'state': model.state_dict()}
-        torch.save(sd, cp_fname(epoch))
+        torch.save(sd, cp_fname(context.root_p, epoch))
 
-def analysis_scalar(xs, ys, ylab, context: PlotContext = PlotContext(), ylim=None):
+def analysis_scalar(xs, ys, xlab, ylab, context: PlotContext = PlotContext(), ylim=None):
   f = plt.figure(1)
   plt.clf()
   plt.plot(xs, ys)
+  plt.xlabel(xlab)
   plt.ylabel(ylab)
   if ylim is not None: plt.ylim(ylim)
   if context.show_plot: plt.show()
   plt.draw()
   if context.save_p is not None: f.savefig(os.path.join(context.full_p(True), f'{ylab}.png'))
 
-def do_eval_model(model, prefix, base_forward_fn, loss_fn, eval_data):
+def do_eval_model(model, prefix, base_forward_fn, loss_fn, eval_data):  
+  def has_term(outs, name: str):
+    return len(outs) > 0 and outs[0] and 'mutual_information' in outs[0][0]
+  
+  context = PlotContext(subdir=prefix)
+
   num_ticks = []
   accs = []
+  outs = []
   for nt in range(16):
     eval_forward_fn = lambda args: base_forward_fn(*args, forced_num_ticks=nt + 1)
-    loss, acc = eval_model(model, eval_forward_fn, loss_fn, eval_data)
+    loss, acc, out = eval_model(model, eval_forward_fn, loss_fn, eval_data)
     accs.append(acc)
+    outs.append(out)
     num_ticks.append(nt + 1)
+
   accs = np.array(accs)
   num_ticks = np.array(num_ticks)
-  analysis_scalar(num_ticks, accs, 'accuracy', context=PlotContext(subdir=prefix), ylim=[0, 1])
+  analysis_scalar(num_ticks, accs, 'ticks', 'accuracy', context=context, ylim=[0.5, 1])
+
+  if has_term(outs, 'mutual_information'):
+    mis = [np.mean(np.array([y['mutual_information'] for y in x])) for x in outs]
+    analysis_scalar(num_ticks, mis, 'ticks', 'mutual information', context=context)
+
+  if has_term(outs, 'kl_divergence'):
+    kls = [np.mean(np.array([y['kl_divergence'].item() for y in x])) for x in outs]
+    analysis_scalar(num_ticks, kls, 'ticks', 'KL(z, N(0, 1))', context=context)
 
 if __name__ == '__main__':
   task = 'logic'
@@ -176,17 +218,23 @@ if __name__ == '__main__':
   assert task in ['addition', 'parity', 'logic']
   assert model_type in ['simple', 'variational']
 
+  do_eval = False
   train_batch_size = 128
   # train_batch_size = 1024
   eval_batch_size = 1000 * 10
-  num_epochs = 100000 * 5
+  num_epochs = 10000 * 2
   # num_epochs = 100
-  max_num_ticks = 3
-  do_eval = False
+  max_num_ticks = 2
   variational_latent_dim = 4
   ctx = TrainContext(
-    save_checkpoints=False
+    save_checkpoints=True,
+    root_p=os.getcwd()
   )
+  
+  beta = 0.1
+  # beta = 8.
+  # beta = 2.
+  # beta = 1.
 
   if task == 'parity':
     input_dim = 64
@@ -237,7 +285,7 @@ if __name__ == '__main__':
     model = RecurrentVariationalPredictor(
       input_dim=input_dim, hidden_dim=rnn_hidden_dim, latent_dim=variational_latent_dim, 
       output_dim=num_classes, max_num_ticks=max_num_ticks)
-    loss_fn = lambda args: variational_loss(*args, beta=0.1)
+    loss_fn = lambda args: variational_loss(*args, beta=beta)
     forward_fn = variational_forward
 
   else: assert False
@@ -245,13 +293,22 @@ if __name__ == '__main__':
   train_forward_fn = lambda args: forward_fn(*args, forced_num_ticks=max_num_ticks)
   eval_forward_fn = lambda args: forward_fn(*args, forced_num_ticks=max_num_ticks)
   
-  eval_epoch = 270000
-  # eval_epoch = 499000
-  if do_eval: model.load_state_dict(torch.load(cp_fname(eval_epoch))['state'])
-  
   if not do_eval:
     train_model(
       ctx, model, train_forward_fn, eval_forward_fn, loss_fn, train_data, eval_data, 
       num_epochs=num_epochs, learning_rate=1e-3)
+    
   else:
-    do_eval_model(model, CP_PREFIX, forward_fn, loss_fn, eval_data)
+    eps = np.array(cp_epochs(ctx.root_p))
+    accs = np.zeros(eps.shape)
+    for i, ep in enumerate(eps):
+      model.load_state_dict(torch.load(cp_fname(ctx.root_p, ep))['state'])
+      loss, acc, out = eval_model(model, eval_forward_fn, loss_fn, eval_data)
+      accs[i] = acc
+
+    analysis_scalar(eps, accs, 'episodes', 'accuracy_over_training', 
+                    context=PlotContext(subdir=CP_PREFIX), ylim=[0.4, 1.])
+
+    # eval_epoch = max(eps)
+    # model.load_state_dict(torch.load(cp_fname(ctx.root_p, eval_epoch))['state'])
+    # do_eval_model(model, CP_PREFIX, forward_fn, loss_fn, eval_data)
