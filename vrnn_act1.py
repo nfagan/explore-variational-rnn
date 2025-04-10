@@ -1,17 +1,23 @@
-from tasks import generate_logic_task_sequence, generate_addition_task_sequence, generate_parity_task_sequence
+from tasks import (
+  generate_logic_task_sequence, generate_addition_task_sequence, 
+  generate_parity_task_sequence
+)
+
 from experiment.logictask import LogicDataset as LD
 
 from models import (
   RecurrentVariationalPredictor, SimpleRecurrentPredictor,
   variational_forward, variational_loss, simple_forward, simple_loss
 )
+
+from plotting import PlotContext, plot_line, plot_lines, plot_scatter
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from matplotlib import pyplot as plt
 from typing import Tuple, List
 from dataclasses import dataclass
 import os, re
@@ -20,21 +26,9 @@ import os, re
 # CP_PREFIX = 'variational-high-beta'   # beta = 8, 3 ticks
 # CP_PREFIX = 'variational-beta_0.1_5_ticks'      
 # CP_PREFIX = 'variational-beta_0.1_4_ticks'
-CP_PREFIX = 'variational-beta_0.1_2_ticks'
+CP_PREFIX = 'variational-beta_0.1_16_ticks'
 # CP_PREFIX = 'variational-low-beta'      # beta = 0.1, 3 ticks
 # CP_PREFIX = 'simple-large-logic'
-
-@dataclass
-class PlotContext:
-  show_plot: bool = True
-  save_p: str = os.path.join(os.getcwd(), 'plots')
-  subdir: str = None
-  # save_p: str = None
-
-  def full_p(self, req: bool=False):
-    res = self.save_p if self.subdir is None else os.path.join(self.save_p, self.subdir)
-    if req: os.makedirs(res, exist_ok=True)
-    return res
   
 @dataclass
 class TrainContext:
@@ -99,7 +93,7 @@ class ParityDataset(Dataset):
     x, y, mask = generate_parity_task_sequence(input_dim)
     return x.unsqueeze(0), y.unsqueeze(0).type(torch.long), mask.unsqueeze(0)
 
-def eval_model(model, forward_fn, loss_fn, data_loader):
+def eval_model(model, forward_fn, loss_fn, data_loader, verbose=True):
   model.eval()
   total_loss = total_acc = 0.0
   total_outs = []
@@ -112,10 +106,10 @@ def eval_model(model, forward_fn, loss_fn, data_loader):
     ns += 1
   avg_loss = total_loss / ns
   avg_acc = total_acc / ns
-  print(f'(Eval): Loss: {avg_loss:.4f} | Acc: {avg_acc:.2f}')
+  if verbose: print(f'(Eval): Loss: {avg_loss:.4f} | Acc: {avg_acc:.2f}')
   return avg_loss, avg_acc, total_outs
 
-def cp_epochs(root_p: str) -> List[str]:
+def cp_epochs(root_p: str, prefix: str) -> List[str]:
   def find_and_extract(directory: str, substring: str):
     results = []
     # Compile regex to capture the last integer before the ".pth" extension.
@@ -129,13 +123,13 @@ def cp_epochs(root_p: str) -> List[str]:
           number = int(match.group(1))
           results.append((filename, number))
     return results
-  res = find_and_extract(os.path.join(root_p, 'checkpoints'), CP_PREFIX)
+  res = find_and_extract(os.path.join(root_p, 'checkpoints'), prefix)
   res = sorted(res, key=lambda x: x[1])
   res = [v[1] for v in res]
   return res
 
-def cp_fname(root_p: str, epoch: int):
-  return os.path.join(root_p, 'checkpoints', f'cp-{CP_PREFIX}-{epoch}.pth')
+def cp_fname(root_p: str, prefix: str, epoch: int):
+  return os.path.join(root_p, 'checkpoints', f'cp-{prefix}-{epoch}.pth')
 
 def train_model(
   context: TrainContext, model, train_forward_fn, eval_forward_fn, loss_fn, train_data, eval_data, 
@@ -169,22 +163,11 @@ def train_model(
       eval_model(model, eval_forward_fn, loss_fn, eval_data)
       if context.save_checkpoints:
         sd = {'state': model.state_dict()}
-        torch.save(sd, cp_fname(context.root_p, epoch))
-
-def analysis_scalar(xs, ys, xlab, ylab, context: PlotContext = PlotContext(), ylim=None):
-  f = plt.figure(1)
-  plt.clf()
-  plt.plot(xs, ys)
-  plt.xlabel(xlab)
-  plt.ylabel(ylab)
-  if ylim is not None: plt.ylim(ylim)
-  if context.show_plot: plt.show()
-  plt.draw()
-  if context.save_p is not None: f.savefig(os.path.join(context.full_p(True), f'{ylab}.png'))
+        torch.save(sd, cp_fname(context.root_p, CP_PREFIX, epoch))
 
 def do_eval_model(model, prefix, base_forward_fn, loss_fn, eval_data):  
   def has_term(outs, name: str):
-    return len(outs) > 0 and outs[0] and 'mutual_information' in outs[0][0]
+    return len(outs) > 0 and outs[0] and name in outs[0][0]
   
   context = PlotContext(subdir=prefix)
 
@@ -200,15 +183,15 @@ def do_eval_model(model, prefix, base_forward_fn, loss_fn, eval_data):
 
   accs = np.array(accs)
   num_ticks = np.array(num_ticks)
-  analysis_scalar(num_ticks, accs, 'ticks', 'accuracy', context=context, ylim=[0.5, 1])
+  plot_line(num_ticks, accs, 'ticks', 'accuracy', context=context, ylim=[0.5, 1])
 
   if has_term(outs, 'mutual_information'):
     mis = [np.mean(np.array([y['mutual_information'] for y in x])) for x in outs]
-    analysis_scalar(num_ticks, mis, 'ticks', 'mutual information', context=context)
+    plot_line(num_ticks, mis, 'ticks', 'mutual information', context=context)
 
   if has_term(outs, 'kl_divergence'):
     kls = [np.mean(np.array([y['kl_divergence'].item() for y in x])) for x in outs]
-    analysis_scalar(num_ticks, kls, 'ticks', 'KL(z, N(0, 1))', context=context)
+    plot_line(num_ticks, kls, 'ticks', 'KL(z, N(0, 1))', context=context)
 
 if __name__ == '__main__':
   task = 'logic'
@@ -218,13 +201,13 @@ if __name__ == '__main__':
   assert task in ['addition', 'parity', 'logic']
   assert model_type in ['simple', 'variational']
 
-  do_eval = False
+  do_train = False
   train_batch_size = 128
   # train_batch_size = 1024
   eval_batch_size = 1000 * 10
   num_epochs = 10000 * 2
   # num_epochs = 100
-  max_num_ticks = 2
+  max_num_ticks = 8
   variational_latent_dim = 4
   ctx = TrainContext(
     save_checkpoints=True,
@@ -293,22 +276,69 @@ if __name__ == '__main__':
   train_forward_fn = lambda args: forward_fn(*args, forced_num_ticks=max_num_ticks)
   eval_forward_fn = lambda args: forward_fn(*args, forced_num_ticks=max_num_ticks)
   
-  if not do_eval:
+  if do_train:
     train_model(
       ctx, model, train_forward_fn, eval_forward_fn, loss_fn, train_data, eval_data, 
       num_epochs=num_epochs, learning_rate=1e-3)
     
   else:
-    eps = np.array(cp_epochs(ctx.root_p))
-    accs = np.zeros(eps.shape)
-    for i, ep in enumerate(eps):
-      model.load_state_dict(torch.load(cp_fname(ctx.root_p, ep))['state'])
-      loss, acc, out = eval_model(model, eval_forward_fn, loss_fn, eval_data)
-      accs[i] = acc
+    if False:
+      eps = np.array(cp_epochs(ctx.root_p, CP_PREFIX))
+      accs = np.zeros(eps.shape)
+      for i, ep in enumerate(eps):
+        model.load_state_dict(torch.load(cp_fname(ctx.root_p, CP_PREFIX, ep))['state'])
+        loss, acc, out = eval_model(model, eval_forward_fn, loss_fn, eval_data)
+        accs[i] = acc
 
-    analysis_scalar(eps, accs, 'episodes', 'accuracy_over_training', 
-                    context=PlotContext(subdir=CP_PREFIX), ylim=[0.4, 1.])
+      plot_line(eps, accs, 'episodes', 'accuracy_over_training', 
+                context=PlotContext(subdir=CP_PREFIX), ylim=[0.4, 1.])
+    
+    if True:
+      make_fn = lambda tick: lambda args: forward_fn(*args, forced_num_ticks=tick)
 
-    # eval_epoch = max(eps)
-    # model.load_state_dict(torch.load(cp_fname(ctx.root_p, eval_epoch))['state'])
-    # do_eval_model(model, CP_PREFIX, forward_fn, loss_fn, eval_data)
+      ticks = [1, 2, 3, 4, 5, 8, 16]
+      # ticks = ticks[:2]
+      ticks_str = [f'num_ticks={x}' for x in ticks]
+      eps = np.array(cp_epochs(ctx.root_p, CP_PREFIX))
+      # eps = eps[:3]
+
+      last_only = True
+      shp = (1, len(ticks)) if last_only else (len(eps), len(ticks))
+      max_mis = np.zeros(shp)
+      max_mis = np.zeros(shp)
+      max_mi_ticks = np.zeros_like(max_mis)
+      max_mi_src_eps = np.zeros_like(max_mis)
+      accs = np.zeros((len(eps), len(ticks)))
+
+      for ti, t in enumerate(ticks):
+        print(f'{ti+1} of {len(ticks)}')
+        for i, ep in enumerate(eps):
+          print(f'\t{i+1} of {len(eps)}')
+
+          prefix = f'variational-beta_0.1_{t}_ticks'
+          # @TODO, change prefix for forced_num_ticks=3 for consistency
+          prefix = 'variational-low-beta' if t == 3 else prefix 
+          model.load_state_dict(torch.load(cp_fname(ctx.root_p, prefix, ep))['state'])
+
+          if False:
+            loss, acc, out = eval_model(model, make_fn(t), loss_fn, eval_data, verbose=False)
+            accs[i, ti] = acc
+          
+          if not last_only or i + 1 == len(eps):
+            res = [eval_model(model, make_fn(tick), loss_fn, eval_data, verbose=False) for tick in ticks]
+            mis = [x[2][0]['mutual_information'].mean() for x in res]
+            di = 0 if last_only else i
+            max_mis[di, ti] = max(mis)
+            max_mi_ticks[di, ti] = ticks[np.argmax(mis)]
+            max_mi_src_eps[di, ti] = ep
+
+      do_norm = lambda x: (x - x.min()) / (1. if x.max() == x.min() else x.max() - x.min())
+      summary_ctx = PlotContext(subdir='summary')
+      plot_scatter(max_mi_ticks, max_mis, ticks_str,  do_norm(max_mi_src_eps), 
+                   'best ticks', 'best mutual information', context=summary_ctx, scale=[8, 8])
+      # plot_lines(eps, accs, ticks_str, 'episodes', 'accuracy_over_training', context=summary_ctx)
+
+    if False:
+      eval_epoch = max(eps)
+      model.load_state_dict(torch.load(cp_fname(ctx.root_p, CP_PREFIX, eval_epoch))['state'])
+      do_eval_model(model, CP_PREFIX, forward_fn, loss_fn, eval_data)
