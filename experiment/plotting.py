@@ -3,6 +3,65 @@ from scipy.stats import chi2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import os
+from dataclasses import dataclass
+
+@dataclass
+class PlotContext:
+  show_plot: bool = False
+  save_p: str = os.path.join(os.getcwd(), 'plots')
+  subdir: str = None
+  # save_p: str = None
+
+  def full_p(self, req: bool=False):
+    res = self.save_p if self.subdir is None else os.path.join(self.save_p, self.subdir)
+    if req: os.makedirs(res, exist_ok=True)
+    return res
+
+def panels(N: int):
+  return [plt.subplot(*subplot_shape(N), i+1) for i in range(N)]
+
+def subplot_shape(N: int):
+  if N <= 3:
+    return [1, N]
+  elif N == 8:
+    return [2, 4]
+  else:
+    n_rows = round(np.sqrt(N))
+    n_cols = np.ceil(N/n_rows)
+    return [int(n_rows), int(n_cols)]
+  
+def maybe_save_fig(fname: str, context: PlotContext=PlotContext(), f=None):
+  if f is None: f = plt.gcf()
+  if context.save_p is not None: f.savefig(os.path.join(context.full_p(True), f'{fname}.png'))
+
+def plot_line(xs, ys, xlab, ylab, context: PlotContext=PlotContext(), ylim=None):
+  f = plt.figure(1)
+  plt.clf()
+  plt.plot(xs, ys)
+  plt.xlabel(xlab)
+  plt.ylabel(ylab)
+  if ylim is not None: plt.ylim(ylim)
+  if context.show_plot: plt.show()
+  plt.draw()
+  if context.save_p is not None: f.savefig(os.path.join(context.full_p(True), f'{ylab}.png'))
+
+def plot_lines(xs, ys, by, xlab, ylab, context: PlotContext=PlotContext(), ylim=None):
+  f = plt.figure(1)
+  plt.clf()
+  h = plt.plot(xs, ys)
+  plt.xlabel(xlab)
+  plt.ylabel(ylab)
+  num_lines = len(by)
+  cmap = plt.get_cmap('spring', num_lines)(np.arange(num_lines))[:, :3]
+  for i in range(num_lines):
+    h[i].set_color(cmap[i, :])
+    h[i].set_label(f'{by[i]}')
+  if ylim is not None: plt.ylim(ylim)
+  plt.legend()
+  if context.show_plot: plt.show()
+  plt.draw()
+  if context.save_p is not None: f.savefig(os.path.join(context.full_p(True), f'{ylab}.png'))
 
 def plot_image(ax, x, y, C, **imshow_kwargs):
   x = np.asarray(x)
@@ -56,11 +115,10 @@ def plot_gaussian_ellipse(mu, cov, ax=None, confidence=0.95, **ellipse_kwargs):
   ax.set_aspect("equal", adjustable="datalim")
   ax.autoscale_view()
 
-def plot_embeddings(ax, mu: torch.Tensor, L: torch.Tensor, y: torch.Tensor, cmap: np.ndarray):
+def plot_embeddings(ax, mu: torch.Tensor, cov: torch.Tensor, y: torch.Tensor, cmap: np.ndarray):
   assert mu.shape[1] == 2
-  assert L.shape[1:] == (2, 2)
-  assert mu.shape[0] == L.shape[0]
-  cov = L @ L.transpose(-1, -2)
+  assert cov.shape[1:] == (2, 2)
+  assert mu.shape[0] == cov.shape[0]
   # cov = cov.transpose(-1, -2)
 
   for i in range(mu.shape[0]):
