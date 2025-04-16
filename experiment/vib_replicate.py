@@ -1,4 +1,3 @@
-import sklearn.feature_extraction
 import plotting
 import torch
 import torch.nn as nn
@@ -302,15 +301,7 @@ def eval_classif(dec: Decoder, l0: float, l1: float, np: int, cmap: np.ndarray):
 
 def eval_classif_entropy(dec: Decoder, l0: float, l1: float, np: int):
   x = torch.linspace(l0, l1, np)
-  if False:
-    xx, yy = torch.meshgrid(x, x)
-    zs = torch.stack([xx.flatten(), yy.flatten()], dim=1)
-    yh = dec(zs).detach()
-    entropy = -torch.sum(yh * yh.log(), dim=1)
-    # @TODO: Double check this ordering
-    res = entropy.unflatten(0, (np, np)).transpose(-1, -2)
-
-  res2 = torch.zeros((np, np))
+  res = torch.zeros((np, np))
   for i in range(np):
     for j in range(np):
       # res2[i, j] = i/100.0 * j/100.0
@@ -319,10 +310,8 @@ def eval_classif_entropy(dec: Decoder, l0: float, l1: float, np: int):
       expect_z = dec(z).detach()
       e = expect_z * expect_z.log()
       e[expect_z == 0.] = 0.
-      res2[i, j] = -torch.sum(e)
-
-  r = res2
-  return r
+      res[i, j] = -torch.sum(e)
+  return res
 
 def discrete_entropy(ys, nc: int) -> float:
   fy = np.zeros((nc,))
@@ -338,7 +327,7 @@ def evaluate_ticks(
   ims, ys = make_batch(data_test)
   batch_size = ims.shape[0]
   
-  num_ticks = 6
+  num_ticks = 8
   accs = np.zeros((num_ticks,))
   errs = np.zeros_like(accs)
   ticks = np.arange(num_ticks) + 1.
@@ -384,16 +373,11 @@ def evaluate_ticks(
     areas[0, t] /= cov.shape[0]
     anisos[0, t] /= cov.shape[0]
 
-  # err over ticks
   plotting.plot_line(ticks, errs * 100., 'Ticks', 'Error (%)', context=ctx)
-  # I(X; Z), I(Y; Z)
   plotting.plot_line(ticks, mis[0, :], 'Ticks', 'I(X; Z)', context=ctx)
   plotting.plot_line(ticks, mis[1, :], 'Ticks', 'I(Y; Z)', context=ctx)
-  # covariance
   plotting.plot_lines(ticks, covs.T, ['z_11', 'z_22', 'z_12'], 'Ticks', 'Covariances', context=ctx)
-  # areas
   plotting.plot_line(ticks, areas.T, 'Ticks', 'Area of ellipse', context=ctx)
-  # anisos
   plotting.plot_line(ticks, anisos.T, 'Ticks', 'Anisotropy of ellipse', context=ctx)
 
   pi = torch.randperm(min(ys.shape[0], 1000))
@@ -428,7 +412,9 @@ def evaluate_ticks(
   fig.set_figwidth(15); fig.set_figheight(15)
   plotting.maybe_save_fig('classif', context=ctx)
 
-def evaluate(interface: ModelInterface, enc: Encoder, dec: Decoder, mnist_test, mnist_train):
+def evaluate(
+  interface: ModelInterface, enc: Encoder, dec: Decoder, mnist_test, mnist_train, ctx: plotting.PlotContext):
+  """"""
   enc.eval()
   dec.eval()
 
@@ -448,7 +434,7 @@ def evaluate(interface: ModelInterface, enc: Encoder, dec: Decoder, mnist_test, 
 
     if len(mus.shape) == 2:
       mus = mus.unsqueeze(2)
-      sigmas = sigmas.unsqueeze(2)
+      sigmas = sigmas.unsqueeze(3)
 
     nt = mus.shape[-1]
     fig = plt.figure(1); fig.clf()
@@ -481,18 +467,19 @@ def evaluate(interface: ModelInterface, enc: Encoder, dec: Decoder, mnist_test, 
       ax.set_xlim(lims)
       ax.set_ylim(lims)
       ax.set_title(f'test error: {err_test:.3f}%')
-    plt.show()
+    fig.set_figwidth(15); fig.set_figheight(15)
+    plotting.maybe_save_fig('classif', context=ctx)
 
 # ------------------------------------------------------------------------------------------------
 
 if __name__ == '__main__':
-  beta = 1e-3
+  beta = 1e-2
   K = 2
   # K = 256
   full_cov = True
   nc = 10
 
-  do_train = False
+  do_train = True
   do_save = True
   is_recurrent = True
   rand_ticks = True
@@ -501,7 +488,7 @@ if __name__ == '__main__':
 
   root_p = os.path.join(os.getcwd(), 'data')
   cp_p = os.path.join(root_p, 
-    f'checkpoint-beta_{beta:0.3f}-full_cov_{full_cov}-recurrent_{is_recurrent}-rand_ticks_{rand_ticks}.pth')
+    f'checkpoint-beta_{beta:0.4f}-full_cov_{full_cov}-recurrent_{is_recurrent}-rand_ticks_{rand_ticks}.pth')
 
   mnist_train = datasets.mnist.MNIST(root_p, download=True, train=True, transform=ToTensor())
   mnist_test = datasets.mnist.MNIST(root_p, download=True, train=False, transform=ToTensor())
@@ -539,6 +526,9 @@ if __name__ == '__main__':
       torch.save(cp, cp_p)
   else:
     ctx = plotting.PlotContext()
-    ctx.subdir = f'beta_{beta}'
-    evaluate_ticks(interface, enc, dec, mnist_test, mnist_train, ctx)
-    # evaluate(interface, enc, dec, mnist_test, mnist_train)
+    ctx.subdir = f'recurrent_{is_recurrent}-beta_{beta}'
+    ctx.do_save = do_save
+    if is_recurrent:
+      evaluate_ticks(interface, enc, dec, mnist_test, mnist_train, ctx)
+    else:
+      evaluate(interface, enc, dec, mnist_test, mnist_train, ctx)

@@ -11,6 +11,7 @@ class PlotContext:
   show_plot: bool = False
   save_p: str = os.path.join(os.getcwd(), 'plots')
   subdir: str = None
+  do_save: bool = True
   # save_p: str = None
 
   def full_p(self, req: bool=False):
@@ -33,7 +34,7 @@ def subplot_shape(N: int):
   
 def maybe_save_fig(fname: str, context: PlotContext=PlotContext(), f=None):
   if f is None: f = plt.gcf()
-  if context.save_p is not None: f.savefig(os.path.join(context.full_p(True), f'{fname}.png'))
+  if context.do_save: f.savefig(os.path.join(context.full_p(True), f'{fname}.png'))
 
 def plot_line(xs, ys, xlab, ylab, context: PlotContext=PlotContext(), ylim=None):
   f = plt.figure(1)
