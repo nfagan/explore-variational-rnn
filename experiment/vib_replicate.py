@@ -1,10 +1,14 @@
 import plotting
+from logictask import LogicDataset as AltLogicDataset
+from tasks import generate_logic_task_sequence, generate_parity_task_sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.datasets as datasets
 from torchvision.transforms import ToTensor
+from torch.utils.data import Dataset, DataLoader
 import torch.optim
+from torch.multiprocessing import Process
 import numpy as np
 import sklearn.feature_selection
 import matplotlib.pyplot as plt
@@ -12,44 +16,131 @@ from scipy.io import savemat
 import os
 from dataclasses import dataclass
 import itertools
-from typing import Callable, Tuple, Dict
+from typing import Callable, Tuple, Dict, List
 
 # ------------------------------------------------------------------------------------------------
 
+class ParityDataset(Dataset):
+  def __init__(self, batch_size: int, input_dim: int):
+    super().__init__()
+    self.batch_size = batch_size
+    self.input_dim = input_dim
+  
+  def __len__(self):
+    return self.batch_size
+  
+  def __getitem__(self, idx):
+    input_dim = self.input_dim
+    x, y, mask = generate_parity_task_sequence(input_dim)
+    y = y.type(torch.long)
+    # make x: (Nx1), y: (1,)
+    x = x.unsqueeze(-1)
+    return x, y
+
+class LogicDataset(Dataset):
+  def __init__(self, batch_size: int, seq_len: int, num_ops: int, num_samples: int = None):
+    super().__init__()
+    self.batch_size = batch_size
+    self.seq_len = seq_len
+    self.num_ops = num_ops
+    self.samples = []
+    self.num_samples = num_samples
+
+    if num_samples is not None:
+      for _ in range(num_samples):
+        x, y = generate_logic_task_sequence(self.seq_len, self.num_ops)
+        self.samples.append((x, y))
+  
+  def __len__(self):
+    if self.num_samples is not None:
+      return self.num_samples
+    else:
+      return self.batch_size
+  
+  def __getitem__(self, idx):
+    if self.num_samples is not None:
+      x, y = self.samples[idx]
+    else:
+      x, y = generate_logic_task_sequence(self.seq_len, self.num_ops)
+    # x: (seq_len x N) | y: (seq_len x 1) | m: (seq_len x 1)
+    y = y.type(torch.long)
+    x = x.T
+    y = y.T.squeeze(0)
+    return x, y
+
+class WrappedMNISTDataset(Dataset):
+  def __init__(self, ims: torch.Tensor, ys: torch.Tensor):
+    super().__init__()
+    self.ims = ims
+    self.ys = ys
+  
+  def __len__(self):
+    return self.ys.shape[0]
+  
+  def __getitem__(self, idx):
+    ims = self.ims.select(0, idx)
+    ys = self.ys[idx]
+    return ims, ys
+
+# ------------------------------------------------------------------------------------------------
+
+class EncoderParams(object):
+  def get(self): return {}
+
+class RecurrentEncoderParams(EncoderParams):
+  def __init__(self, max_num_ticks: int):
+    super().__init__()
+    self.max_num_ticks = max_num_ticks
+  def get(self): 
+    return {'num_ticks': 1 + np.random.randint(self.max_num_ticks)}
+
 @dataclass
 class ModelInterface:
-  encoder_params: Callable[[], Dict]
+  encoder_params: EncoderParams
   forward: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 
 # ------------------------------------------------------------------------------------------------
 
 class RecurrentEncoder(nn.Module):
-  def __init__(self, *, K: int, full_cov: bool):
+  def __init__(self, *, input_dim: int, K: int, full_cov: bool, beta: float):
     super().__init__()
 
     num_distribution_params = K + (2 ** K) - 1 if full_cov else 2 * K
     use_mlp = False
     hd = 1024
 
-    self.mlp = nn.Sequential(nn.Linear(784, 1024), nn.ReLU()) if use_mlp else None
+    self.mlp = nn.Sequential(nn.Linear(input_dim, 1024), nn.ReLU()) if use_mlp else None
     # self.rnn = nn.RNN(1024 if use_mlp else 784, 1024)
-    self.rnn = nn.RNNCell(1024 if use_mlp else 784, hd)
+    self.rnn = nn.RNNCell(1024 if use_mlp else input_dim, hd)
     self.fe = nn.Linear(hd, num_distribution_params)
 
     self.K = K #  bottleneck size
     self.full_cov = full_cov
     self.use_mlp = use_mlp
     self.hidden_dim = hd
+    self.beta = beta
+    self.input_dim = input_dim
 
-  def ctor_params(self): return {'K': self.K, 'full_cov': self.full_cov}
+  def ctor_params(self): return {
+    'K': self.K, 'full_cov': self.full_cov, 'input_dim': self.input_dim, 'beta': self.beta
+  }
+
+  def sample(self, mus: torch.Tensor, L_or_sigma: torch.Tensor):
+    if self.full_cov:
+      raise NotImplementedError
+      eps = torch.randn_like(mus).unsqueeze(-1)
+      z = mus.unsqueeze(-1) + L_or_sigma @ eps
+    else:
+      eps = torch.randn_like(L_or_sigma)
+      z = eps * L_or_sigma + mus
+    return z
 
   def kl(self, mus: torch.Tensor, L_or_sigma: torch.Tensor):
-    if self.full_cov:
-      for i in range(mus.shape[-1]):
-        kl = kl_full_gaussian(mus.select(-1, i), L_or_sigma.select(-1, i))
-        s = kl if i == 0 else s + kl
-      return s / mus.shape[-1]
-    else: raise NotImplementedError
+    for i in range(mus.shape[-1]):
+      mu, sig = mus.select(-1, i), L_or_sigma.select(-1, i)
+      kl = kl_full_gaussian(mu, sig) if self.full_cov else kl_diagonal_gaussian(mu, sig)
+      s = kl if i == 0 else s + kl
+    return s / mus.shape[-1]
 
   def forward(self, x: torch.Tensor, *, num_ticks: int, hx: torch.Tensor=None):
     all_zs = []
@@ -81,28 +172,29 @@ class RecurrentEncoder(nn.Module):
         all_mus.append(mus)
         all_ls.append(L)
       else:
-        raise NotImplementedError
         mus = fe[:, :self.K]
         sigmas = F.softplus(fe[:, self.K:] - 5.)
         eps = torch.randn_like(sigmas)
         z = eps * sigmas + mus
-        return z, mus, sigmas
+        all_zs.append(z)
+        all_mus.append(mus)
+        all_ls.append(sigmas)
       
     zs = torch.stack(all_zs, dim=-1)
-    mus = torch.stack(all_zs, dim=-1)
+    mus = torch.stack(all_mus, dim=-1)
     L = torch.stack(all_ls, dim=-1)
-    return zs, mus, L
+    return zs, mus, L, hx
 
 # ------------------------------------------------------------------------------------------------
 
 class Encoder(nn.Module):
-  def __init__(self, *, K: int, full_cov: bool):
+  def __init__(self, *, input_dim: int, K: int, full_cov: bool, beta: float):
     super().__init__()
 
     num_distribution_params = K + (2 ** K) - 1 if full_cov else 2 * K
 
     self.mlp = nn.Sequential(
-      nn.Linear(784, 1024),
+      nn.Linear(input_dim, 1024),
       nn.ReLU(),
       nn.Linear(1024, 1024),
       nn.ReLU(),
@@ -111,8 +203,12 @@ class Encoder(nn.Module):
     )
     self.K = K #  bottleneck size
     self.full_cov = full_cov
+    self.beta = beta
+    self.input_dim = input_dim
 
-  def ctor_params(self): return {'K': self.K, 'full_cov': self.full_cov}
+  def ctor_params(self): return {
+    'K': self.K, 'full_cov': self.full_cov, 'input_dim': self.input_dim, 'beta': self.beta
+  }    
 
   def kl(self, mus: torch.Tensor, L_or_sigma: torch.Tensor):
     if self.full_cov:
@@ -177,7 +273,7 @@ def kl_full_gaussian(mu: torch.Tensor, L: torch.Tensor) -> torch.Tensor:
   return kl.sum()
 
 def forward_recurrent(
-  enc: RecurrentEncoder, dec: Decoder, ims: torch.Tensor, ys: torch.Tensor, enc_params: Dict):
+  enc: RecurrentEncoder, dec: Decoder, xs: torch.Tensor, ys: torch.Tensor, enc_params: Dict):
   """"""
   def losses_per_tick(enc, dec, zs, mus, sigmas, ys):
     nt = zs.shape[-1]
@@ -189,22 +285,37 @@ def forward_recurrent(
       ces[i] = F.cross_entropy(yhats, ys, reduction='sum')
     return kls, ces
   
-  batch_size = ims.shape[0]
+  if len(xs.shape) == 2:
+    # make into a sequence
+    xs = xs.unsqueeze(-1)
+    ys = ys.unsqueeze(-1)
+  
+  batch_size = xs.shape[0]
+  seq_len = xs.shape[-1]
+  hx = None
 
-  # zs, mus, sigmas = enc(ims, num_ticks=np.random.randint(1, 5), hx=None)
-  zs, mus, sigmas = enc(ims, **enc_params)
-  # yhats = dec(zs)
-  yhats = dec(zs.select(-1, -1))
+  for t in range(seq_len):
+    x = xs.select(-1, t)
+    y = ys.select(-1, t)
 
-  L_kl = enc.kl(mus, sigmas)
-  L_ce = F.cross_entropy(yhats, ys, reduction='sum')
-  L = L_ce + beta * L_kl
-  L /= batch_size
+    zs, mus, sigmas, hx = enc(x, **enc_params, hx=hx)
+    # yhats = dec(zs)
+    yhats = dec(zs.select(-1, -1))
 
-  est = torch.argmax(yhats, dim=1).reshape(ys.shape)
-  acc = torch.sum(est == ys) / ys.numel()
+    L_kl = enc.kl(mus, sigmas)
+    L_ce = F.cross_entropy(yhats, y, reduction='sum')
+    L = L_ce + enc.beta * L_kl
+    L /= batch_size
 
-  kls, ces = losses_per_tick(enc, dec, zs, mus, sigmas, ys)
+    est = torch.argmax(yhats, dim=1).reshape(y.shape)
+    acc = torch.sum(est == y) / y.numel()
+
+    kls, ces = losses_per_tick(enc, dec, zs, mus, sigmas, y)
+
+    if t == 0:
+      seq_L, seq_L_kl, seq_L_ce = L, L_kl, L_ce
+    else:
+      seq_L, seq_L_kl, seq_L_ce = seq_L+L, seq_L_kl+L_kl, seq_L_ce+L_ce
 
   addtl = {}
   addtl['acc'] = acc
@@ -212,12 +323,12 @@ def forward_recurrent(
   addtl['zs'] = zs
   addtl['mus'] = mus
   addtl['sigmas'] = sigmas
-  addtl['L_kl'] = L_kl
-  addtl['L_ce'] = L_ce
+  addtl['L_kl'] = seq_L_kl
+  addtl['L_ce'] = seq_L_ce
   addtl['L_kl_per_tick'] = kls
   addtl['L_ce_per_tick'] = ces
 
-  return L, addtl
+  return seq_L, addtl
 
 def forward(enc: Encoder, dec: Decoder, ims: torch.Tensor, ys: torch.Tensor, enc_params: Dict):
   batch_size = ims.shape[0]
@@ -246,6 +357,11 @@ def forward(enc: Encoder, dec: Decoder, ims: torch.Tensor, ys: torch.Tensor, enc
 
 # ------------------------------------------------------------------------------------------------
 
+def make_mnist_dataloader(mnist, batch_size: int):
+  ims, ys = make_batch(mnist)
+  d = WrappedMNISTDataset(ims, ys)
+  return DataLoader(d, batch_size=batch_size)
+
 def make_batch_indices(mnist, batch_size):
   si = torch.randperm(len(mnist))
   num_batches = len(mnist) // batch_size
@@ -270,23 +386,30 @@ def make_batch(mnist, si: torch.Tensor = None):
 
 def train(
   interface: ModelInterface, enc: Encoder, dec: Decoder, 
-  num_epochs: int, mnist_train, batch_size: int):
+  num_epochs: int, data: DataLoader, cp_p: str, cp_name: str, do_save: bool):
   """"""
   optim = torch.optim.Adam([*enc.parameters()] + [*dec.parameters()], lr=1e-4, betas=[0.5, 0.999])
 
-  use_lr_sched = True
+  use_lr_sched = False
   if use_lr_sched: lr_sched = torch.optim.lr_scheduler.ExponentialLR(optimizer=optim, gamma=0.97)
 
   for e in range(num_epochs):
-    for si, bi in enumerate(make_batch_indices(mnist_train, batch_size)):
-      ims, ys = make_batch(mnist_train, bi)
-      L, res = interface.forward(enc, dec, ims, ys, interface.encoder_params())
+    si = 0
+    for xs, ys in data:
+      L, res = interface.forward(enc, dec, xs, ys, interface.encoder_params.get())
       optim.zero_grad()
       L.backward()
       optim.step()
       acc = res["acc"] * 100.
       if si % 100 == 0: print(f'{si} | {e+1} of {num_epochs} | Loss: {L.item():.3f} | Acc: {acc:0.3f}%')
+      si += 1
     if use_lr_sched and e % 2 == 0: lr_sched.step()
+    if do_save and (e % 10 == 0 or e + 1 == num_epochs): 
+      torch.save(make_checkpoint(enc, dec), os.path.join(cp_p, f'{cp_name}-{e}.pth'))
+
+def train_set(arg_sets):
+  for args in arg_sets: 
+    train(*args)
 
 # ------------------------------------------------------------------------------------------------
 
@@ -324,23 +447,45 @@ def discrete_entropy(ys, nc: int) -> float:
   return hy.sum().item()
 
 def evaluate_ticks(
-  interface, enc: RecurrentEncoder, dec: Decoder, data_test, data_train, ctx: plotting.PlotContext):
+  interface, enc: RecurrentEncoder, dec: Decoder, data_test, ctx: plotting.PlotContext):
   """"""
-  ims, ys = make_batch(data_test)
+  samps = [x for x in data_test]
+  ims = [x[0] for x in samps]
+  ys = [x[1] for x in samps]
+  ims = torch.concat(ims, dim=0)
+  ys = torch.concat(ys, dim=0)
+
+  # ims, ys = make_batch(data_test)
   batch_size = ims.shape[0]
   
   num_ticks = 8
   accs = np.zeros((num_ticks,))
   errs = np.zeros_like(accs)
+  mc_accs = np.zeros_like(accs)
+  mc_errs = np.zeros_like(accs)
   ticks = np.arange(num_ticks) + 1.
   for t in range(num_ticks):
     print(f'{t+1} of {num_ticks}')
-    _, res = interface.forward(enc, dec, ims, ys, {'num_ticks': t+1, 'hx': None})
+    _, res = interface.forward(enc, dec, ims, ys, {'num_ticks': t+1})
     accs[t] = res['acc']
     errs[t] = res['err']
+
+    num_mc = 100
+    acc_mc = 0.
+    err_mc = 0.
+    if True:
+      for i in range(num_mc):
+        zs, mus, sigmas, _ = enc(ims, num_ticks=t+1)
+        yhats = dec(zs.select(-1, -1))
+        res = torch.multinomial(yhats, 1, True).squeeze(1)
+        tacc = (res == ys).sum() / res.shape[0]
+        acc_mc += tacc
+        err_mc += (1 - tacc)
+    mc_accs[t] = acc_mc / num_mc
+    mc_errs[t] = err_mc / num_mc
   
   # evaluate with maximum ticks
-  _, res = interface.forward(enc, dec, ims, ys, {'num_ticks': num_ticks, 'hx': None})
+  _, res = interface.forward(enc, dec, ims, ys, {'num_ticks': num_ticks})
 
   # summarize change in cov over ticks
   covs = np.zeros((3, num_ticks))
@@ -417,6 +562,7 @@ def evaluate_ticks(
   out = {
     'ticks': ticks,
     'errs': errs,
+    'mc_errs': mc_errs,
     'mis': mis,
     'covs': covs,
     'areas': areas,
@@ -433,11 +579,11 @@ def evaluate(
   dec.eval()
 
   eval_ims, eval_ys = make_batch(mnist_test)
-  _, eval_res = interface.forward(enc, dec, eval_ims, eval_ys, interface.encoder_params())
+  _, eval_res = interface.forward(enc, dec, eval_ims, eval_ys, interface.encoder_params.get())
   err_test = eval_res["err"] * 100.
 
   ims, ys = make_batch(mnist_train)
-  _, train_res = interface.forward(enc, dec, ims, ys, interface.encoder_params())
+  _, train_res = interface.forward(enc, dec, ims, ys, interface.encoder_params.get())
   err_train = train_res["err"] * 100.
   print(f'train error: {err_train:.3f}% | test error: {err_test:.3f}%')
 
@@ -490,76 +636,152 @@ def make_checkpoint(enc, dec):
     'enc_params': enc.ctor_params(), 'dec_params': dec.ctor_params()}
   return cp
 
+def instantiate_model(cp: Dict, enc_fn):
+  if 'input_dim' not in cp['enc_params']: cp['enc_params']['input_dim'] = 784
+  enc = enc_fn(**cp['enc_params']); enc.load_state_dict(cp['enc_state'])
+  dec = Decoder(**cp['dec_params']); dec.load_state_dict(cp['dec_state'])
+  return enc, dec
+
+def split_array_indices(M: int, N: int) -> List[np.ndarray[int]]:
+  # Return indices to split sequence with length `M` into at most `N` disjoint sets
+  if M >= N:
+    subset_size = M // N
+    subsets = []
+    for i in range(N):
+      start = i * subset_size
+      end = (i + 1) * subset_size if i + 1 < N else M
+      subsets.append(np.array(range(start, end)))
+    return subsets
+  else:
+    # Not enough elements to form N subsets; return one-element subsets
+    return [np.array(range(i, i+1)) for i in range(M)]
+
 # ------------------------------------------------------------------------------------------------
 
-if __name__ == '__main__':
-  do_train = False
+def main():
+  root_p = os.path.join(os.getcwd(), 'data')
+  res_p = os.path.join(os.getcwd(), 'results')
+  
+  task_type = 'mnist'
+  num_processes = 5
+  assert task_type in ['parity', 'logic', 'mnist']
+  do_train = True
   do_save_results = True
-  do_save_plots = True
+  do_save_plots = False
+  do_show_plots = False
   is_recurrent = True
   rand_ticks = True
   batch_size = 100
   num_epochs = 100
+  
+  if task_type == 'logic':
+    K = 256
+    full_cov = False
+    nc = 2
+    num_ops = 10
+    input_dim = num_ops * 10 + 2
+    seq_len = 3
+    ldp = {'batch_size': batch_size, 'seq_len': seq_len, 'num_ops': num_ops}
+    data_train = DataLoader(LogicDataset(**ldp, num_samples=60_000), batch_size=batch_size)
+    data_test = DataLoader(LogicDataset(**ldp, num_samples=10_000), batch_size=batch_size)
 
-  # betas = [1e-1, 1e-2, 1e-3, 1e-4, 0.]
-  betas = [1e-5, 0.]
-  max_num_ticks_set = [2, 4, 6]
+  elif task_type == 'parity':
+    K = 4
+    full_cov = False
+    nc = 2
+    input_dim = 64
+    nc = 2
+    data_train = DataLoader(ParityDataset(60_000, input_dim), batch_size=batch_size)
+    data_test = DataLoader(ParityDataset(10_000, input_dim), batch_size=batch_size)
+
+  elif task_type == 'mnist':
+    K = 2
+    full_cov = True
+    nc = 10
+    input_dim = 784
+    data_train = make_mnist_dataloader(
+      datasets.mnist.MNIST(root_p, download=True, train=True, transform=ToTensor()), batch_size)
+    data_test = make_mnist_dataloader(
+      datasets.mnist.MNIST(root_p, download=True, train=False, transform=ToTensor()), batch_size)
+  
+  # betas = [1e-3]
+  # betas = [1.5e-2, 2e-2, 1.5e-3, 2e-3]
+  # betas = [1e-3, 1.5e-3, 2e-3, 1e-2, 1.5e-2, 2e-2]
+  # max_num_ticks_set = [2, 4, 6]
+
+  """compare mc error for low vs. high compression"""
+  # betas = [1e-3, 1e-2]
+  # max_num_ticks_set = [6]
+  """"""
+
+  betas = [1e-1, 1e-2, 1e-3, 1e-4, 0.]
+  # betas = [1e-5, 0.]
+  # max_num_ticks_set = [2, 4, 6]
+  max_num_ticks_set = [4, 6, 2]
   p = [*itertools.product(betas, max_num_ticks_set)]
 
+  train_args = []
   for ip, cmb in enumerate(p):
     print(f'{ip+1} of {len(p)}')
 
     beta, max_num_ticks = cmb
 
     hp = {}
+    hp['task_type'] = task_type
     hp['beta'] = beta
-    K = hp['K'] = 2
+    K = hp['K'] = K
     # K = 256
-    full_cov = hp['full_cov'] = True
+    full_cov = hp['full_cov'] = full_cov
     hp['max_num_ticks'] = max_num_ticks
     nc = 10
 
-    root_p = os.path.join(os.getcwd(), 'data')
-    res_p = os.path.join(os.getcwd(), 'results')
     cp_name = f'checkpoint-beta_{beta:0.4f}-full_cov_{full_cov}-recurrent_{is_recurrent}' + \
-              f'-rand_ticks_{rand_ticks}-max_ticks_{max_num_ticks}'
+              f'-rand_ticks_{rand_ticks}-max_ticks_{max_num_ticks}-task_type_{task_type}'
     cp_p = os.path.join(root_p, f'{cp_name}.pth')
-
-    mnist_train = datasets.mnist.MNIST(root_p, download=True, train=True, transform=ToTensor())
-    mnist_test = datasets.mnist.MNIST(root_p, download=True, train=False, transform=ToTensor())
+    if (not do_train) and (not os.path.exists(cp_p)): print(f'No such file: {cp_name}'); continue
 
     enc_fn = RecurrentEncoder if is_recurrent else Encoder
-
-    rec_encoder_params_fn = lambda: {
-      'num_ticks': 1 + np.random.randint(max_num_ticks), 'hx': None
-    }
     interface = ModelInterface(
       forward=forward_recurrent if is_recurrent else forward,
-      encoder_params=rec_encoder_params_fn if is_recurrent else lambda: {}
+      encoder_params=RecurrentEncoderParams(max_num_ticks) if is_recurrent else EncoderParams()
     )
 
     if do_train:
-      enc = enc_fn(K=K, full_cov=full_cov)
+      enc = enc_fn(K=K, full_cov=full_cov, input_dim=input_dim, beta=beta)
       dec = Decoder(K=K, nc=nc)
     else:
       cp = torch.load(cp_p)
-      enc = enc_fn(**cp['enc_params']); enc.load_state_dict(cp['enc_state'])
-      dec = Decoder(**cp['dec_params']); dec.load_state_dict(cp['dec_state'])
+      enc, dec = instantiate_model(cp, enc_fn)
 
     print(f'Enc params: {count_parameters(enc)} | Dec params: {count_parameters(dec)}')
 
     if do_train:
-      train(interface, enc, dec, num_epochs, mnist_train, batch_size)
-      if do_save_results:
-        cp = make_checkpoint(enc, dec)
-        torch.save(cp, cp_p)
+      train_args.append((interface, enc, dec, num_epochs, data_train, root_p, cp_name, do_save_results))
     else:
-      ctx = plotting.PlotContext()
-      ctx.subdir = cp_name
-      ctx.do_save = do_save_plots
-      if is_recurrent:
-        out = evaluate_ticks(interface, enc, dec, mnist_test, mnist_train, ctx)
-        out['hp'] = hp
-        if do_save_results: savemat(os.path.join(res_p, f'{cp_name}.mat'), out)
-      else:
-        evaluate(interface, enc, dec, mnist_test, mnist_train, ctx)
+      for id, ds in enumerate([data_test]):
+        sn = 'test' if id == 0 else 'train'
+        cp_name_split = cp_name if sn == 'test' else f'train_{cp_name}'
+        ctx = plotting.PlotContext()
+        ctx.subdir = cp_name_split
+        ctx.do_save = do_save_plots
+        ctx.show_plot = do_show_plots
+        if is_recurrent:
+          out = evaluate_ticks(interface, enc, dec, ds, ctx)
+          out['hp'] = hp
+          out['hp']['split'] = sn
+          if do_save_results: savemat(os.path.join(res_p, f'{cp_name_split}.mat'), out)
+        else:
+          evaluate(interface, enc, dec, ds, ctx)
+
+  if do_train:
+    if num_processes <= 0:
+      train_set(train_args)
+    else:
+      pi = split_array_indices(len(train_args), num_processes)
+      process_args = [[train_args[x] for x in y] for y in pi]
+      processes = [Process(target=train_set, args=(args,)) for args in process_args]
+      for p in processes: p.start()
+      for p in processes: p.join()
+
+if __name__ == '__main__':
+  main()
