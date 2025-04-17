@@ -8,8 +8,10 @@ import torch.optim
 import numpy as np
 import sklearn.feature_selection
 import matplotlib.pyplot as plt
+from scipy.io import savemat
 import os
 from dataclasses import dataclass
+import itertools
 from typing import Callable, Tuple, Dict
 
 # ------------------------------------------------------------------------------------------------
@@ -412,8 +414,20 @@ def evaluate_ticks(
   fig.set_figwidth(15); fig.set_figheight(15)
   plotting.maybe_save_fig('classif', context=ctx)
 
+  out = {
+    'ticks': ticks,
+    'errs': errs,
+    'mis': mis,
+    'covs': covs,
+    'areas': areas,
+    'anisos': anisos,
+  }
+
+  return out
+
 def evaluate(
-  interface: ModelInterface, enc: Encoder, dec: Decoder, mnist_test, mnist_train, ctx: plotting.PlotContext):
+  interface: ModelInterface, enc: Encoder, dec: Decoder, 
+  mnist_test, mnist_train, ctx: plotting.PlotContext):
   """"""
   enc.eval()
   dec.eval()
@@ -470,65 +484,82 @@ def evaluate(
     fig.set_figwidth(15); fig.set_figheight(15)
     plotting.maybe_save_fig('classif', context=ctx)
 
+def make_checkpoint(enc, dec):
+  cp = {
+    'enc_state': enc.state_dict(), 'dec_state': dec.state_dict(), 
+    'enc_params': enc.ctor_params(), 'dec_params': dec.ctor_params()}
+  return cp
+
 # ------------------------------------------------------------------------------------------------
 
 if __name__ == '__main__':
-  beta = 1e-2
-  K = 2
-  # K = 256
-  full_cov = True
-  nc = 10
-
-  do_train = True
-  do_save = True
+  do_train = False
+  do_save_results = True
+  do_save_plots = True
   is_recurrent = True
   rand_ticks = True
   batch_size = 100
   num_epochs = 100
 
-  root_p = os.path.join(os.getcwd(), 'data')
-  cp_p = os.path.join(root_p, 
-    f'checkpoint-beta_{beta:0.4f}-full_cov_{full_cov}-recurrent_{is_recurrent}-rand_ticks_{rand_ticks}.pth')
+  # betas = [1e-1, 1e-2, 1e-3, 1e-4, 0.]
+  betas = [1e-5, 0.]
+  max_num_ticks_set = [2, 4, 6]
+  p = [*itertools.product(betas, max_num_ticks_set)]
 
-  mnist_train = datasets.mnist.MNIST(root_p, download=True, train=True, transform=ToTensor())
-  mnist_test = datasets.mnist.MNIST(root_p, download=True, train=False, transform=ToTensor())
+  for ip, cmb in enumerate(p):
+    print(f'{ip+1} of {len(p)}')
 
-  enc_fn = RecurrentEncoder if is_recurrent else Encoder
+    beta, max_num_ticks = cmb
 
-  rec_encoder_params_fn = lambda: {
-    'num_ticks': np.random.randint(1, 5) if do_train else 6, 'hx': None
-  }
-  interface = ModelInterface(
-    forward=forward_recurrent if is_recurrent else forward,
-    encoder_params=rec_encoder_params_fn if is_recurrent else lambda: {}
-  )
+    hp = {}
+    hp['beta'] = beta
+    K = hp['K'] = 2
+    # K = 256
+    full_cov = hp['full_cov'] = True
+    hp['max_num_ticks'] = max_num_ticks
+    nc = 10
 
-  if do_train:
-    enc = enc_fn(K=K, full_cov=full_cov)
-    dec = Decoder(K=K, nc=nc)
-  else:
-    cp = torch.load(cp_p)
-    enc = enc_fn(**cp['enc_params']); enc.load_state_dict(cp['enc_state'])
-    dec = Decoder(**cp['dec_params']); dec.load_state_dict(cp['dec_state'])
+    root_p = os.path.join(os.getcwd(), 'data')
+    res_p = os.path.join(os.getcwd(), 'results')
+    cp_name = f'checkpoint-beta_{beta:0.4f}-full_cov_{full_cov}-recurrent_{is_recurrent}' + \
+              f'-rand_ticks_{rand_ticks}-max_ticks_{max_num_ticks}'
+    cp_p = os.path.join(root_p, f'{cp_name}.pth')
 
-  print(f'Num encoder params: {count_parameters(enc)}')
-  print(f'Num decoder params: {count_parameters(dec)}')
+    mnist_train = datasets.mnist.MNIST(root_p, download=True, train=True, transform=ToTensor())
+    mnist_test = datasets.mnist.MNIST(root_p, download=True, train=False, transform=ToTensor())
 
-  if do_train:
-    train(interface, enc, dec, num_epochs, mnist_train, batch_size)
-    if do_save:
-      cp = {
-        'enc_state': enc.state_dict(), 
-        'dec_state': dec.state_dict(), 
-        'enc_params': enc.ctor_params(), 
-        'dec_params': dec.ctor_params()
-      }
-      torch.save(cp, cp_p)
-  else:
-    ctx = plotting.PlotContext()
-    ctx.subdir = f'recurrent_{is_recurrent}-beta_{beta}'
-    ctx.do_save = do_save
-    if is_recurrent:
-      evaluate_ticks(interface, enc, dec, mnist_test, mnist_train, ctx)
+    enc_fn = RecurrentEncoder if is_recurrent else Encoder
+
+    rec_encoder_params_fn = lambda: {
+      'num_ticks': 1 + np.random.randint(max_num_ticks), 'hx': None
+    }
+    interface = ModelInterface(
+      forward=forward_recurrent if is_recurrent else forward,
+      encoder_params=rec_encoder_params_fn if is_recurrent else lambda: {}
+    )
+
+    if do_train:
+      enc = enc_fn(K=K, full_cov=full_cov)
+      dec = Decoder(K=K, nc=nc)
     else:
-      evaluate(interface, enc, dec, mnist_test, mnist_train, ctx)
+      cp = torch.load(cp_p)
+      enc = enc_fn(**cp['enc_params']); enc.load_state_dict(cp['enc_state'])
+      dec = Decoder(**cp['dec_params']); dec.load_state_dict(cp['dec_state'])
+
+    print(f'Enc params: {count_parameters(enc)} | Dec params: {count_parameters(dec)}')
+
+    if do_train:
+      train(interface, enc, dec, num_epochs, mnist_train, batch_size)
+      if do_save_results:
+        cp = make_checkpoint(enc, dec)
+        torch.save(cp, cp_p)
+    else:
+      ctx = plotting.PlotContext()
+      ctx.subdir = cp_name
+      ctx.do_save = do_save_plots
+      if is_recurrent:
+        out = evaluate_ticks(interface, enc, dec, mnist_test, mnist_train, ctx)
+        out['hp'] = hp
+        if do_save_results: savemat(os.path.join(res_p, f'{cp_name}.mat'), out)
+      else:
+        evaluate(interface, enc, dec, mnist_test, mnist_train, ctx)
