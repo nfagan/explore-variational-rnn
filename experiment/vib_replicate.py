@@ -293,6 +293,7 @@ def forward_recurrent(
   batch_size = xs.shape[0]
   seq_len = xs.shape[-1]
   hx = None
+  seq_yhats = []
 
   for t in range(seq_len):
     x = xs.select(-1, t)
@@ -317,6 +318,8 @@ def forward_recurrent(
     else:
       seq_L, seq_L_kl, seq_L_ce = seq_L+L, seq_L_kl+L_kl, seq_L_ce+L_ce
 
+    seq_yhats.append(yhats)
+
   addtl = {}
   addtl['acc'] = acc
   addtl['err'] = 1. - acc
@@ -327,6 +330,7 @@ def forward_recurrent(
   addtl['L_ce'] = seq_L_ce
   addtl['L_kl_per_tick'] = kls
   addtl['L_ce_per_tick'] = ces
+  addtl['yhat'] = torch.stack(seq_yhats, dim=-1)
 
   return seq_L, addtl
 
@@ -338,7 +342,7 @@ def forward(enc: Encoder, dec: Decoder, ims: torch.Tensor, ys: torch.Tensor, enc
 
   L_kl = enc.kl(mus, sigmas)
   L_ce = F.cross_entropy(yhats, ys, reduction='sum')
-  L = L_ce + beta * L_kl
+  L = L_ce + enc.beta * L_kl
   L /= batch_size
 
   est = torch.argmax(yhats, dim=1).reshape(ys.shape)
@@ -390,7 +394,7 @@ def train(
   """"""
   optim = torch.optim.Adam([*enc.parameters()] + [*dec.parameters()], lr=1e-4, betas=[0.5, 0.999])
 
-  use_lr_sched = False
+  use_lr_sched = True
   if use_lr_sched: lr_sched = torch.optim.lr_scheduler.ExponentialLR(optimizer=optim, gamma=0.97)
 
   for e in range(num_epochs):
@@ -410,6 +414,14 @@ def train(
 def train_set(arg_sets):
   for args in arg_sets: 
     train(*args)
+
+def eval_set(arg_sets):
+  for args in arg_sets:
+    hp, do_save_results, res_p, cp_name_split, eval_args = args
+    out = evaluate_ticks(*eval_args)
+    out['hp'] = hp
+    if do_save_results:
+      savemat(os.path.join(res_p, f'{cp_name_split}.mat'), out)
 
 # ------------------------------------------------------------------------------------------------
 
@@ -458,22 +470,25 @@ def evaluate_ticks(
   # ims, ys = make_batch(data_test)
   batch_size = ims.shape[0]
   
-  num_ticks = 8
+  num_ticks = 10
   accs = np.zeros((num_ticks,))
   errs = np.zeros_like(accs)
   mc_accs = np.zeros_like(accs)
   mc_errs = np.zeros_like(accs)
   ticks = np.arange(num_ticks) + 1.
+  pys = np.zeros((num_ticks, ys.shape[0], dec.nc))
+
   for t in range(num_ticks):
     print(f'{t+1} of {num_ticks}')
     _, res = interface.forward(enc, dec, ims, ys, {'num_ticks': t+1})
     accs[t] = res['acc']
     errs[t] = res['err']
+    pys[t] = res['yhat'].detach().cpu().squeeze(-1).numpy()
 
     num_mc = 100
     acc_mc = 0.
     err_mc = 0.
-    if True:
+    if False:
       for i in range(num_mc):
         zs, mus, sigmas, _ = enc(ims, num_ticks=t+1)
         yhats = dec(zs.select(-1, -1))
@@ -520,44 +535,45 @@ def evaluate_ticks(
     areas[0, t] /= cov.shape[0]
     anisos[0, t] /= cov.shape[0]
 
-  plotting.plot_line(ticks, errs * 100., 'Ticks', 'Error (%)', context=ctx)
-  plotting.plot_line(ticks, mis[0, :], 'Ticks', 'I(X; Z)', context=ctx)
-  plotting.plot_line(ticks, mis[1, :], 'Ticks', 'I(Y; Z)', context=ctx)
-  plotting.plot_lines(ticks, covs.T, ['z_11', 'z_22', 'z_12'], 'Ticks', 'Covariances', context=ctx)
-  plotting.plot_line(ticks, areas.T, 'Ticks', 'Area of ellipse', context=ctx)
-  plotting.plot_line(ticks, anisos.T, 'Ticks', 'Anisotropy of ellipse', context=ctx)
+  if ctx.show_plot or ctx.do_save:
+    plotting.plot_line(ticks, errs * 100., 'Ticks', 'Error (%)', context=ctx)
+    plotting.plot_line(ticks, mis[0, :], 'Ticks', 'I(X; Z)', context=ctx)
+    plotting.plot_line(ticks, mis[1, :], 'Ticks', 'I(Y; Z)', context=ctx)
+    plotting.plot_lines(ticks, covs.T, ['z_11', 'z_22', 'z_12'], 'Ticks', 'Covariances', context=ctx)
+    plotting.plot_line(ticks, areas.T, 'Ticks', 'Area of ellipse', context=ctx)
+    plotting.plot_line(ticks, anisos.T, 'Ticks', 'Anisotropy of ellipse', context=ctx)
 
-  pi = torch.randperm(min(ys.shape[0], 1000))
-  mus = res['mus'].index_select(0, pi)
-  sigmas = res['sigmas'].index_select(0, pi)
+    pi = torch.randperm(min(ys.shape[0], 1000))
+    mus = res['mus'].index_select(0, pi)
+    sigmas = res['sigmas'].index_select(0, pi)
 
-  nt = mus.shape[-1]
-  fig = plt.figure(1); fig.clf()
-  axs = plotting.panels(nt)
+    nt = mus.shape[-1]
+    fig = plt.figure(1); fig.clf()
+    axs = plotting.panels(nt)
 
-  cmap = plt.get_cmap('hsv', dec.nc)(np.arange(dec.nc))[:, :3]
-  lims = [-40, 40]
+    cmap = plt.get_cmap('hsv', dec.nc)(np.arange(dec.nc))[:, :3]
+    lims = [-40, 40]
 
-  dec_entropy = eval_classif_entropy(dec, lims[0], lims[1], 256)
-  de = dec_entropy; de = (de - de.min()) / (de.max() - de.min())
-  class_bounds = eval_classif(dec, lims[0], lims[1], 256, cmap)    
-  # when entropy is low, 1 - de is close to 1, so the color is bright.
-  # when entropy is high, 1 - de is close to 0, so the color is darker.
-  lp = 0.125
-  bg_im = class_bounds * (lp + (1. - lp) * (1. - de[:, :, None]))
+    dec_entropy = eval_classif_entropy(dec, lims[0], lims[1], 256)
+    de = dec_entropy; de = (de - de.min()) / (de.max() - de.min())
+    class_bounds = eval_classif(dec, lims[0], lims[1], 256, cmap)    
+    # when entropy is low, 1 - de is close to 1, so the color is bright.
+    # when entropy is high, 1 - de is close to 0, so the color is darker.
+    lp = 0.125
+    bg_im = class_bounds * (lp + (1. - lp) * (1. - de[:, :, None]))
 
-  for i in range(nt):
-    ax = axs[i]
-    L = sigmas.select(-1, i)
-    cov = L @ L.transpose(-1, -2)
-    plotting.plot_embeddings(ax, mus.select(-1, i), cov, ys[pi], cmap)
-    plotting.plot_image(ax, lims, lims, bg_im, cmap='gray')
-    ax.set_xlim(lims)
-    ax.set_ylim(lims)
-    ax.set_title(f'ticks={i+1}, test error={(errs[i] * 100.):.3f}%')
+    for i in range(nt):
+      ax = axs[i]
+      L = sigmas.select(-1, i)
+      cov = L @ L.transpose(-1, -2)
+      plotting.plot_embeddings(ax, mus.select(-1, i), cov, ys[pi], cmap)
+      plotting.plot_image(ax, lims, lims, bg_im, cmap='gray')
+      ax.set_xlim(lims)
+      ax.set_ylim(lims)
+      ax.set_title(f'ticks={i+1}, test error={(errs[i] * 100.):.3f}%')
 
-  fig.set_figwidth(15); fig.set_figheight(15)
-  plotting.maybe_save_fig('classif', context=ctx)
+    fig.set_figwidth(15); fig.set_figheight(15)
+    plotting.maybe_save_fig('classif', context=ctx)
 
   out = {
     'ticks': ticks,
@@ -567,6 +583,8 @@ def evaluate_ticks(
     'covs': covs,
     'areas': areas,
     'anisos': anisos,
+    'py': pys,
+    'y': ys.detach().cpu().numpy()
   }
 
   return out
@@ -659,13 +677,27 @@ def split_array_indices(M: int, N: int) -> List[np.ndarray[int]]:
 # ------------------------------------------------------------------------------------------------
 
 def main():
+  num_processes = 5
+  set_fn, arg_sets = prepare()
+
+  if num_processes <= 0:
+    set_fn(arg_sets)
+  else:
+    pi = split_array_indices(len(arg_sets), num_processes)
+    process_args = [[arg_sets[x] for x in y] for y in pi]
+    processes = [Process(target=set_fn, args=(args,)) for args in process_args]
+    for p in processes: p.start()
+    for p in processes: p.join()
+
+# ------------------------------------------------------------------------------------------------
+
+def prepare():
   root_p = os.path.join(os.getcwd(), 'data')
   res_p = os.path.join(os.getcwd(), 'results')
   
   task_type = 'mnist'
-  num_processes = 5
   assert task_type in ['parity', 'logic', 'mnist']
-  do_train = True
+  do_train = False
   do_save_results = True
   do_save_plots = False
   do_show_plots = False
@@ -673,6 +705,8 @@ def main():
   rand_ticks = True
   batch_size = 100
   num_epochs = 100
+  eval_epochs = [*np.arange(0, num_epochs, 10)] + [num_epochs-1]
+  # eval_epochs = eval_epochs[-1:]
   
   if task_type == 'logic':
     K = 256
@@ -714,17 +748,19 @@ def main():
   # max_num_ticks_set = [6]
   """"""
 
-  betas = [1e-1, 1e-2, 1e-3, 1e-4, 0.]
-  # betas = [1e-5, 0.]
-  # max_num_ticks_set = [2, 4, 6]
-  max_num_ticks_set = [4, 6, 2]
-  p = [*itertools.product(betas, max_num_ticks_set)]
+  # betas = [1e-1, 1e-2, 1e-3, 1e-4, 0.]
+  # max_num_ticks_set = [4, 6, 2]
 
-  train_args = []
+  betas = np.array([0.25, 0.5, 1, 1.5, 2, 4]) * 1e-3
+  max_num_ticks_set = [6]
+
+  p = [*itertools.product(betas, max_num_ticks_set, [0] if do_train else eval_epochs)]
+
+  arg_sets = []
   for ip, cmb in enumerate(p):
     print(f'{ip+1} of {len(p)}')
 
-    beta, max_num_ticks = cmb
+    beta, max_num_ticks, epoch = cmb
 
     hp = {}
     hp['task_type'] = task_type
@@ -733,12 +769,17 @@ def main():
     # K = 256
     full_cov = hp['full_cov'] = full_cov
     hp['max_num_ticks'] = max_num_ticks
+    hp['epoch'] = epoch
     nc = 10
 
     cp_name = f'checkpoint-beta_{beta:0.4f}-full_cov_{full_cov}-recurrent_{is_recurrent}' + \
               f'-rand_ticks_{rand_ticks}-max_ticks_{max_num_ticks}-task_type_{task_type}'
-    cp_p = os.path.join(root_p, f'{cp_name}.pth')
-    if (not do_train) and (not os.path.exists(cp_p)): print(f'No such file: {cp_name}'); continue
+    if do_train:
+      cp_p = os.path.join(root_p, f'{cp_name}.pth')
+    else:
+      cp_name = f'{cp_name}-{epoch}'
+      cp_p = os.path.join(root_p, f'{cp_name}.pth')
+      if not os.path.exists(cp_p): print(f'No such file: {cp_name}'); continue
 
     enc_fn = RecurrentEncoder if is_recurrent else Encoder
     interface = ModelInterface(
@@ -756,32 +797,24 @@ def main():
     print(f'Enc params: {count_parameters(enc)} | Dec params: {count_parameters(dec)}')
 
     if do_train:
-      train_args.append((interface, enc, dec, num_epochs, data_train, root_p, cp_name, do_save_results))
+      arg_sets.append((interface, enc, dec, num_epochs, data_train, root_p, cp_name, do_save_results))
     else:
       for id, ds in enumerate([data_test]):
         sn = 'test' if id == 0 else 'train'
+        hp['split'] = sn
         cp_name_split = cp_name if sn == 'test' else f'train_{cp_name}'
         ctx = plotting.PlotContext()
         ctx.subdir = cp_name_split
         ctx.do_save = do_save_plots
         ctx.show_plot = do_show_plots
-        if is_recurrent:
-          out = evaluate_ticks(interface, enc, dec, ds, ctx)
-          out['hp'] = hp
-          out['hp']['split'] = sn
-          if do_save_results: savemat(os.path.join(res_p, f'{cp_name_split}.mat'), out)
-        else:
-          evaluate(interface, enc, dec, ds, ctx)
+        arg_sets.append(
+          (hp.copy(), do_save_results, res_p, cp_name_split, (interface, enc, dec, ds, ctx))
+        )
+  
+  set_fn = train_set if do_train else eval_set
+  return set_fn, arg_sets
 
-  if do_train:
-    if num_processes <= 0:
-      train_set(train_args)
-    else:
-      pi = split_array_indices(len(train_args), num_processes)
-      process_args = [[train_args[x] for x in y] for y in pi]
-      processes = [Process(target=train_set, args=(args,)) for args in process_args]
-      for p in processes: p.start()
-      for p in processes: p.join()
+# ------------------------------------------------------------------------------------------------
 
 if __name__ == '__main__':
   main()
