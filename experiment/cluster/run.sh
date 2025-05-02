@@ -9,7 +9,7 @@
 module purge
 module load anaconda3/2024.02
 # conda env create -f environment.yml -p /scratch/naf264/conda/pn0
-conda init bash
+source /home/naf264/.bashrc
 conda activate /scratch/naf264/conda/pn0
 
 cd /home/naf264/source/explore-variational-rnn/experiment
