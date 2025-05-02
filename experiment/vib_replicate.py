@@ -434,7 +434,7 @@ def train(
 
 def train_set(arg_sets):
   for i, args in enumerate(arg_sets):
-    print(f'\t{i+1} of {len(args)}')
+    print(f'\t{i+1} of {len(arg_sets)}')
     train(*args)
 
 def eval_set(arg_sets):
@@ -711,7 +711,7 @@ def main():
   do_save_results = False
   num_epochs = 100
   batch_size = 100
-  task_type = 'logic'
+  task_type = 'mnist'
   
   # enc_hds = [32, 64, 128, 256, 512, 1024]
   # betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.]
