@@ -407,14 +407,15 @@ def train(
       L.backward()
       optim.step()
       acc = res["acc"] * 100.
-      if si % 100 == 0: print(f'{si} | {e+1} of {num_epochs} | Loss: {L.item():.3f} | Acc: {acc:0.3f}%')
+      if si % 100 == 0: print(f'\t\t{si} | {e+1} of {num_epochs} | Loss: {L.item():.3f} | Acc: {acc:0.3f}%')
       si += 1
     if use_lr_sched and e % 2 == 0: lr_sched.step()
     if do_save and (e % 10 == 0 or e + 1 == num_epochs): 
       torch.save(make_checkpoint(enc, dec), os.path.join(cp_p, f'{cp_name}-{e}.pth'))
 
 def train_set(arg_sets):
-  for args in arg_sets: 
+  for i, args in enumerate(arg_sets):
+    print(f'\t{i+1} of {len(args)}')
     train(*args)
 
 def eval_set(arg_sets):
@@ -703,11 +704,14 @@ def main():
   nb = 1 if do_train else len(betas)
   ns = 1 if do_train else len(max_num_ticks_set)
 
-  bi = split_array_indices(len(betas), nb)  # change second len(betas) to 1
+  # loading all of the model combinations for evaluation is too memory intensive, do it in batches.
+  bi = split_array_indices(len(betas), nb)
   si = split_array_indices(len(max_num_ticks_set), ns)
   ei = [*itertools.product(bi, si)]
 
-  for e in ei:
+  for i, e in enumerate(ei):
+    print(f'{i+1} of {len(ei)}')
+
     b, s = e
     bs = [betas[b] for b in b]
     ss = [max_num_ticks_set[s] for s in s]
@@ -716,16 +720,19 @@ def main():
       do_train=do_train, betas=bs, enc_hds=enc_hds, max_num_ticks_set=ss,
       rand_ticks=rand_ticks, num_epochs=num_epochs, batch_size=batch_size)
 
-    if num_processes <= 0:
-      set_fn(arg_sets)
-    else:
-      pi = split_array_indices(len(arg_sets), num_processes)
-      process_args = [[arg_sets[x] for x in y] for y in pi]
-      processes = [Process(target=set_fn, args=(args,)) for args in process_args]
-      for p in processes: p.start()
-      for p in processes: p.join()
+    run(set_fn, arg_sets, num_processes)
 
 # ------------------------------------------------------------------------------------------------
+
+def run(set_fn, arg_sets, num_processes: int):
+  if num_processes <= 0:
+    set_fn(arg_sets)
+  else:
+    pi = split_array_indices(len(arg_sets), num_processes)
+    process_args = [[arg_sets[x] for x in y] for y in pi]
+    processes = [Process(target=set_fn, args=(args,)) for args in process_args]
+    for p in processes: p.start()
+    for p in processes: p.join()
 
 def prepare(
   *, do_train: bool, betas: List[float], enc_hds: List[int], 
@@ -773,16 +780,6 @@ def prepare(
       datasets.mnist.MNIST(root_p, download=True, train=True, transform=ToTensor()), batch_size)
     data_test = make_mnist_dataloader(
       datasets.mnist.MNIST(root_p, download=True, train=False, transform=ToTensor()), batch_size)
-  
-  # betas = [1e-3]
-  # betas = [1.5e-2, 2e-2, 1.5e-3, 2e-3]
-  # betas = [1e-3, 1.5e-3, 2e-3, 1e-2, 1.5e-2, 2e-2]
-  # max_num_ticks_set = [2, 4, 6]
-
-  """compare mc error for low vs. high compression"""
-  # betas = [1e-3, 1e-2]
-  # max_num_ticks_set = [6]
-  """"""
 
   p = [*itertools.product(betas, max_num_ticks_set, enc_hds, [0] if do_train else eval_epochs)]
 
