@@ -426,7 +426,7 @@ def train(
       if si % 100 == 0:
         L_eval, eval_acc = eval_train(interface, enc, dec, data_test, enc_p)
         print(f'\t\t{e+1} of {num_epochs} | Loss: {L.item():.3f} | Acc: {acc:0.3f}% | ' + \
-              f'Eval loss: {L_eval.item():0.3f} | Eval acc: {eval_acc:0.3f}%')
+              f'Eval loss: {L_eval.item():0.3f} | Eval acc: {eval_acc:0.3f}%', flush=True)
       si += 1
     if use_lr_sched and e % 2 == 0: lr_sched.step()
     if do_save and (e % 10 == 0 or e + 1 == num_epochs):
@@ -434,7 +434,7 @@ def train(
 
 def train_set(arg_sets):
   for i, args in enumerate(arg_sets):
-    print(f'\t{i+1} of {len(arg_sets)}')
+    print(f'\t{i+1} of {len(arg_sets)}', flush=True)
     train(*args)
 
 def eval_set(arg_sets):
@@ -705,7 +705,7 @@ def split_array_indices(M: int, N: int) -> List[np.ndarray[int]]:
 # ------------------------------------------------------------------------------------------------
 
 def main():
-  num_processes = 0
+  num_processes = 16
   do_train = True
   rand_ticks = True
   do_save_results = False
@@ -730,7 +730,7 @@ def main():
   ei = [*itertools.product(bi, si)]
 
   for i, e in enumerate(ei):
-    print(f'{i+1} of {len(ei)}')
+    print(f'{i+1} of {len(ei)}', flush=True)
 
     b, s = e
     bs = [betas[b] for b in b]
@@ -811,7 +811,7 @@ def prepare(
 
   arg_sets = []
   for ip, cmb in enumerate(p):
-    print(f'{ip+1} of {len(p)}')
+    print(f'{ip+1} of {len(p)}', flush=True)
 
     beta, max_num_ticks, enc_hd, epoch = cmb
 
