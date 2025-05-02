@@ -102,12 +102,12 @@ class ModelInterface:
 # ------------------------------------------------------------------------------------------------
 
 class RecurrentEncoder(nn.Module):
-  def __init__(self, *, input_dim: int, K: int, full_cov: bool, beta: float):
+  def __init__(self, *, input_dim: int, hidden_dim: int, K: int, full_cov: bool, beta: float):
     super().__init__()
 
     num_distribution_params = K + (2 ** K) - 1 if full_cov else 2 * K
     use_mlp = False
-    hd = 1024
+    hd = hidden_dim
 
     self.mlp = nn.Sequential(nn.Linear(input_dim, 1024), nn.ReLU()) if use_mlp else None
     # self.rnn = nn.RNN(1024 if use_mlp else 784, 1024)
@@ -120,9 +120,11 @@ class RecurrentEncoder(nn.Module):
     self.hidden_dim = hd
     self.beta = beta
     self.input_dim = input_dim
+    self.hidden_dim = hidden_dim
 
   def ctor_params(self): return {
-    'K': self.K, 'full_cov': self.full_cov, 'input_dim': self.input_dim, 'beta': self.beta
+    'K': self.K, 'full_cov': self.full_cov, 'input_dim': self.input_dim, 'beta': self.beta,
+    'hidden_dim': self.hidden_dim
   }
 
   def sample(self, mus: torch.Tensor, L_or_sigma: torch.Tensor):
@@ -505,6 +507,7 @@ def evaluate_ticks(
   # summarize change in cov over ticks
   covs = np.zeros((3, num_ticks))
   areas = np.zeros((1, num_ticks))
+  med_areas = np.zeros_like(areas)
   anisos = np.zeros_like(areas)
   mis_zy = np.zeros((res['zs'].shape[1], num_ticks))
   mis = np.zeros((2, num_ticks))
@@ -526,12 +529,17 @@ def evaluate_ticks(
     covs[0, t] = cov[:, 0, 0].abs().mean()
     covs[1, t] = cov[:, -1, -1].abs().mean()
     covs[2, t] = cov[:, 1, 0].abs().mean()
+    tmp_areas = np.zeros((cov.shape[0],))
+
     for i in range(cov.shape[0]):
       eigvals, eigvecs = np.linalg.eigh(cov.select(0, i).detach().cpu().numpy())
       width, height = 2 * np.sqrt(eigvals)
       mn, mx = min(width, height), max(width, height)
+      tmp_areas[i] = np.pi * width * height
       areas[0, t] += np.pi * width * height
       anisos[0, t] += abs(1. - mx/mn)
+
+    med_areas[0, t] = np.median(tmp_areas)
     areas[0, t] /= cov.shape[0]
     anisos[0, t] /= cov.shape[0]
 
@@ -656,6 +664,7 @@ def make_checkpoint(enc, dec):
 
 def instantiate_model(cp: Dict, enc_fn):
   if 'input_dim' not in cp['enc_params']: cp['enc_params']['input_dim'] = 784
+  if 'hidden_dim' not in cp['enc_params']: cp['enc_params']['hidden_dim'] = 1024
   enc = enc_fn(**cp['enc_params']); enc.load_state_dict(cp['enc_state'])
   dec = Decoder(**cp['dec_params']); dec.load_state_dict(cp['dec_state'])
   return enc, dec
@@ -678,33 +687,60 @@ def split_array_indices(M: int, N: int) -> List[np.ndarray[int]]:
 
 def main():
   num_processes = 5
-  set_fn, arg_sets = prepare()
+  do_train = True
+  rand_ticks = True
+  num_epochs = 100
+  batch_size = 100
+  
+  # enc_hds = [32, 64, 128, 256, 512, 1024]
+  # betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.]
+  # max_num_ticks_set = [6]
 
-  if num_processes <= 0:
-    set_fn(arg_sets)
-  else:
-    pi = split_array_indices(len(arg_sets), num_processes)
-    process_args = [[arg_sets[x] for x in y] for y in pi]
-    processes = [Process(target=set_fn, args=(args,)) for args in process_args]
-    for p in processes: p.start()
-    for p in processes: p.join()
+  enc_hds = [1024]
+  betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.]
+  max_num_ticks_set = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+  nb = 1 if do_train else len(betas)
+  ns = 1 if do_train else len(max_num_ticks_set)
+
+  bi = split_array_indices(len(betas), nb)  # change second len(betas) to 1
+  si = split_array_indices(len(max_num_ticks_set), ns)
+  ei = [*itertools.product(bi, si)]
+
+  for e in ei:
+    b, s = e
+    bs = [betas[b] for b in b]
+    ss = [max_num_ticks_set[s] for s in s]
+
+    set_fn, arg_sets = prepare(
+      do_train=do_train, betas=bs, enc_hds=enc_hds, max_num_ticks_set=ss,
+      rand_ticks=rand_ticks, num_epochs=num_epochs, batch_size=batch_size)
+
+    if num_processes <= 0:
+      set_fn(arg_sets)
+    else:
+      pi = split_array_indices(len(arg_sets), num_processes)
+      process_args = [[arg_sets[x] for x in y] for y in pi]
+      processes = [Process(target=set_fn, args=(args,)) for args in process_args]
+      for p in processes: p.start()
+      for p in processes: p.join()
 
 # ------------------------------------------------------------------------------------------------
 
-def prepare():
+def prepare(
+  *, do_train: bool, betas: List[float], enc_hds: List[int], 
+  max_num_ticks_set: List[int], rand_ticks: bool, num_epochs: int, batch_size: int):
+  """
+  """
   root_p = os.path.join(os.getcwd(), 'data')
   res_p = os.path.join(os.getcwd(), 'results')
   
   task_type = 'mnist'
   assert task_type in ['parity', 'logic', 'mnist']
-  do_train = False
   do_save_results = True
   do_save_plots = False
   do_show_plots = False
   is_recurrent = True
-  rand_ticks = True
-  batch_size = 100
-  num_epochs = 100
   eval_epochs = [*np.arange(0, num_epochs, 10)] + [num_epochs-1]
   # eval_epochs = eval_epochs[-1:]
   
@@ -748,19 +784,13 @@ def prepare():
   # max_num_ticks_set = [6]
   """"""
 
-  # betas = [1e-1, 1e-2, 1e-3, 1e-4, 0.]
-  # max_num_ticks_set = [4, 6, 2]
-
-  betas = np.array([0.25, 0.5, 1, 1.5, 2, 4]) * 1e-3
-  max_num_ticks_set = [6]
-
-  p = [*itertools.product(betas, max_num_ticks_set, [0] if do_train else eval_epochs)]
+  p = [*itertools.product(betas, max_num_ticks_set, enc_hds, [0] if do_train else eval_epochs)]
 
   arg_sets = []
   for ip, cmb in enumerate(p):
     print(f'{ip+1} of {len(p)}')
 
-    beta, max_num_ticks, epoch = cmb
+    beta, max_num_ticks, enc_hd, epoch = cmb
 
     hp = {}
     hp['task_type'] = task_type
@@ -770,10 +800,13 @@ def prepare():
     full_cov = hp['full_cov'] = full_cov
     hp['max_num_ticks'] = max_num_ticks
     hp['epoch'] = epoch
-    nc = 10
+    hp['encoder_hidden_dim'] = enc_hd
+    hp['rand_ticks'] = rand_ticks
+    beta_str = f'{beta:0.4f}' if beta >= 1e-4 else str(beta)
 
-    cp_name = f'checkpoint-beta_{beta:0.4f}-full_cov_{full_cov}-recurrent_{is_recurrent}' + \
+    cp_name = f'checkpoint-beta_{beta_str}-full_cov_{full_cov}-recurrent_{is_recurrent}' + \
               f'-rand_ticks_{rand_ticks}-max_ticks_{max_num_ticks}-task_type_{task_type}'
+    if not enc_hd == 1024: cp_name = f'{cp_name}-enc_hd_{enc_hd}'
     if do_train:
       cp_p = os.path.join(root_p, f'{cp_name}.pth')
     else:
@@ -788,7 +821,7 @@ def prepare():
     )
 
     if do_train:
-      enc = enc_fn(K=K, full_cov=full_cov, input_dim=input_dim, beta=beta)
+      enc = enc_fn(K=K, full_cov=full_cov, input_dim=input_dim, hidden_dim=enc_hd, beta=beta)
       dec = Decoder(K=K, nc=nc)
     else:
       cp = torch.load(cp_p)
