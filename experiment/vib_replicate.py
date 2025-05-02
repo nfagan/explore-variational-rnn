@@ -390,9 +390,24 @@ def make_batch(mnist, si: torch.Tensor = None):
   ys =  torch.tensor(ys)
   return ims, ys
 
+def eval_train(
+  interface: ModelInterface, enc: Encoder, dec: Decoder, data_test: DataLoader, enc_p: dict):
+  """"""
+  enc.eval()
+  dec.eval()
+  exys = [(x, y) for x, y in data_test]
+  ex = torch.cat([x[0] for x in exys], dim=0)
+  ey = torch.cat([x[1] for x in exys], dim=0)
+  L_eval, res_eval = interface.forward(enc, dec, ex, ey, enc_p)
+  eval_acc = res_eval["acc"] * 100.
+  enc.train()
+  dec.train()
+  return L_eval, eval_acc
+
 def train(
   interface: ModelInterface, enc: Encoder, dec: Decoder, 
-  num_epochs: int, data: DataLoader, cp_p: str, cp_name: str, do_save: bool):
+  num_epochs: int, data: DataLoader, data_test: DataLoader, 
+  cp_p: str, cp_name: str, do_save: bool):
   """"""
   optim = torch.optim.Adam([*enc.parameters()] + [*dec.parameters()], lr=1e-4, betas=[0.5, 0.999])
 
@@ -402,15 +417,19 @@ def train(
   for e in range(num_epochs):
     si = 0
     for xs, ys in data:
-      L, res = interface.forward(enc, dec, xs, ys, interface.encoder_params.get())
+      enc_p = interface.encoder_params.get()
+      L, res = interface.forward(enc, dec, xs, ys, enc_p)
       optim.zero_grad()
       L.backward()
       optim.step()
       acc = res["acc"] * 100.
-      if si % 100 == 0: print(f'\t\t{si} | {e+1} of {num_epochs} | Loss: {L.item():.3f} | Acc: {acc:0.3f}%')
+      if si % 100 == 0:
+        L_eval, eval_acc = eval_train(interface, enc, dec, data_test, enc_p)
+        print(f'\t\t{e+1} of {num_epochs} | Loss: {L.item():.3f} | Acc: {acc:0.3f}% | ' + \
+              f'Eval loss: {L_eval.item():0.3f} | Eval acc: {eval_acc:0.3f}%')
       si += 1
     if use_lr_sched and e % 2 == 0: lr_sched.step()
-    if do_save and (e % 10 == 0 or e + 1 == num_epochs): 
+    if do_save and (e % 10 == 0 or e + 1 == num_epochs):
       torch.save(make_checkpoint(enc, dec), os.path.join(cp_p, f'{cp_name}-{e}.pth'))
 
 def train_set(arg_sets):
@@ -423,8 +442,7 @@ def eval_set(arg_sets):
     hp, do_save_results, res_p, cp_name_split, eval_args = args
     out = evaluate_ticks(*eval_args)
     out['hp'] = hp
-    if do_save_results:
-      savemat(os.path.join(res_p, f'{cp_name_split}.mat'), out)
+    if do_save_results: savemat(os.path.join(res_p, f'{cp_name_split}.mat'), out)
 
 # ------------------------------------------------------------------------------------------------
 
@@ -473,7 +491,7 @@ def evaluate_ticks(
   # ims, ys = make_batch(data_test)
   batch_size = ims.shape[0]
   
-  num_ticks = 10
+  num_ticks = 16
   accs = np.zeros((num_ticks,))
   errs = np.zeros_like(accs)
   mc_accs = np.zeros_like(accs)
@@ -687,11 +705,13 @@ def split_array_indices(M: int, N: int) -> List[np.ndarray[int]]:
 # ------------------------------------------------------------------------------------------------
 
 def main():
-  num_processes = 5
+  num_processes = 0
   do_train = True
   rand_ticks = True
+  do_save_results = False
   num_epochs = 100
   batch_size = 100
+  task_type = 'logic'
   
   # enc_hds = [32, 64, 128, 256, 512, 1024]
   # betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.]
@@ -718,7 +738,8 @@ def main():
 
     set_fn, arg_sets = prepare(
       do_train=do_train, betas=bs, enc_hds=enc_hds, max_num_ticks_set=ss,
-      rand_ticks=rand_ticks, num_epochs=num_epochs, batch_size=batch_size)
+      rand_ticks=rand_ticks, num_epochs=num_epochs, batch_size=batch_size, 
+      task_type=task_type, do_save_results=do_save_results)
 
     run(set_fn, arg_sets, num_processes)
 
@@ -736,15 +757,14 @@ def run(set_fn, arg_sets, num_processes: int):
 
 def prepare(
   *, do_train: bool, betas: List[float], enc_hds: List[int], 
-  max_num_ticks_set: List[int], rand_ticks: bool, num_epochs: int, batch_size: int):
+  max_num_ticks_set: List[int], rand_ticks: bool, num_epochs: int, 
+  batch_size: int, task_type: str, do_save_results: bool):
   """
   """
   root_p = os.path.join(os.getcwd(), 'data')
   res_p = os.path.join(os.getcwd(), 'results')
   
-  task_type = 'mnist'
   assert task_type in ['parity', 'logic', 'mnist']
-  do_save_results = True
   do_save_plots = False
   do_show_plots = False
   is_recurrent = True
@@ -752,7 +772,7 @@ def prepare(
   # eval_epochs = eval_epochs[-1:]
   
   if task_type == 'logic':
-    K = 256
+    K = 1024
     full_cov = False
     nc = 2
     num_ops = 10
@@ -827,7 +847,9 @@ def prepare(
     print(f'Enc params: {count_parameters(enc)} | Dec params: {count_parameters(dec)}')
 
     if do_train:
-      arg_sets.append((interface, enc, dec, num_epochs, data_train, root_p, cp_name, do_save_results))
+      arg_sets.append((
+        interface, enc, dec, num_epochs, data_train, data_test, root_p, cp_name, do_save_results
+      ))
     else:
       for id, ds in enumerate([data_test]):
         sn = 'test' if id == 0 else 'train'
