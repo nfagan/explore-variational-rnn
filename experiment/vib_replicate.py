@@ -761,8 +761,14 @@ def prepare(
   batch_size: int, task_type: str, do_save_results: bool):
   """
   """
-  root_p = os.path.join(os.getcwd(), 'data')
-  res_p = os.path.join(os.getcwd(), 'results')
+  base_p = '/scratch/naf264/explore-variational-rnn'
+  # base_p = os.getcwd()
+
+  root_p = os.path.join(base_p, 'data')
+  res_p = os.path.join(base_p, 'results')
+
+  if not os.path.exists(root_p): os.makedirs(root_p, exist_ok=True)
+  if not os.path.exists(res_p): os.makedirs(res_p, exist_ok=True)
   
   assert task_type in ['parity', 'logic', 'mnist']
   do_save_plots = False
