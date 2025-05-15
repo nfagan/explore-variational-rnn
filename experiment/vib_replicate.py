@@ -18,6 +18,8 @@ from dataclasses import dataclass
 import itertools
 from typing import Callable, Tuple, Dict, List
 
+_NO_RANDOM_SEED = -1
+
 # ------------------------------------------------------------------------------------------------
 
 class ParityDataset(Dataset):
@@ -98,11 +100,17 @@ class RecurrentEncoderParams(EncoderParams):
 class ModelInterface:
   encoder_params: EncoderParams
   forward: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+  random_seed: int
 
 # ------------------------------------------------------------------------------------------------
 
 class RecurrentEncoder(nn.Module):
-  def __init__(self, *, input_dim: int, hidden_dim: int, K: int, full_cov: bool, beta: float):
+  def __init__(
+    self, *, input_dim: int, hidden_dim: int, K: int, full_cov: bool, beta: float, 
+    rnn_cell_type: str):
+    """"""
+    assert rnn_cell_type in ['rnn', 'lstm']
+
     super().__init__()
 
     num_distribution_params = K + (2 ** K) - 1 if full_cov else 2 * K
@@ -110,8 +118,15 @@ class RecurrentEncoder(nn.Module):
     hd = hidden_dim
 
     self.mlp = nn.Sequential(nn.Linear(input_dim, 1024), nn.ReLU()) if use_mlp else None
-    # self.rnn = nn.RNN(1024 if use_mlp else 784, 1024)
-    self.rnn = nn.RNNCell(1024 if use_mlp else input_dim, hd)
+    # rnn
+    rnn_input_size = 1024 if use_mlp else input_dim
+    if rnn_cell_type == 'rnn':
+      self.rnn = nn.RNNCell(rnn_input_size, hd)
+    elif rnn_cell_type == 'lstm':
+      self.rnn = nn.LSTMCell(rnn_input_size, hd)
+    else:
+      assert False
+    
     self.fe = nn.Linear(hd, num_distribution_params)
 
     self.K = K #  bottleneck size
@@ -121,10 +136,11 @@ class RecurrentEncoder(nn.Module):
     self.beta = beta
     self.input_dim = input_dim
     self.hidden_dim = hidden_dim
+    self.rnn_cell_type = rnn_cell_type
 
   def ctor_params(self): return {
     'K': self.K, 'full_cov': self.full_cov, 'input_dim': self.input_dim, 'beta': self.beta,
-    'hidden_dim': self.hidden_dim
+    'hidden_dim': self.hidden_dim, 'rnn_cell_type': self.rnn_cell_type
   }
 
   def sample(self, mus: torch.Tensor, L_or_sigma: torch.Tensor):
@@ -150,11 +166,12 @@ class RecurrentEncoder(nn.Module):
     all_ls = []
 
     if self.use_mlp: x = self.mlp(x)
-    if hx is None: hx = torch.zeros(x.shape[0], self.hidden_dim, device=x.device)
+    # if hx is None: hx = torch.zeros(x.shape[0], self.hidden_dim, device=x.device)
 
     for i in range(num_ticks):
       hx = self.rnn(x, hx)
-      fe = self.fe(hx)
+      proj_hx = hx if self.rnn_cell_type == 'rnn' else hx[0]
+      fe = self.fe(proj_hx)
       mus = fe[:, :self.K]
 
       if self.full_cov:
@@ -407,12 +424,12 @@ def eval_train(
 def train(
   interface: ModelInterface, enc: Encoder, dec: Decoder, 
   num_epochs: int, data: DataLoader, data_test: DataLoader, 
-  cp_p: str, cp_name: str, do_save: bool):
+  cp_p: str, cp_name: str, do_save: bool, use_lr_sched: bool, lr: float):
   """"""
-  optim = torch.optim.Adam([*enc.parameters()] + [*dec.parameters()], lr=1e-4, betas=[0.5, 0.999])
+  optim = torch.optim.Adam([*enc.parameters()] + [*dec.parameters()], lr=lr, betas=[0.5, 0.999])
 
-  use_lr_sched = True
   if use_lr_sched: lr_sched = torch.optim.lr_scheduler.ExponentialLR(optimizer=optim, gamma=0.97)
+  if interface.random_seed != _NO_RANDOM_SEED: torch.manual_seed(interface.random_seed)
 
   for e in range(num_epochs):
     si = 0
@@ -429,7 +446,8 @@ def train(
               f'Eval loss: {L_eval.item():0.3f} | Eval acc: {eval_acc:0.3f}%', flush=True)
       si += 1
     if use_lr_sched and e % 2 == 0: lr_sched.step()
-    if do_save and (e % 10 == 0 or e + 1 == num_epochs):
+    # if do_save and (e % 10 == 0 or e + 1 == num_epochs):
+    if do_save and (e + 1 == num_epochs):
       torch.save(make_checkpoint(enc, dec), os.path.join(cp_p, f'{cp_name}-{e}.pth'))
 
 def train_set(arg_sets):
@@ -684,6 +702,7 @@ def make_checkpoint(enc, dec):
 def instantiate_model(cp: Dict, enc_fn):
   if 'input_dim' not in cp['enc_params']: cp['enc_params']['input_dim'] = 784
   if 'hidden_dim' not in cp['enc_params']: cp['enc_params']['hidden_dim'] = 1024
+  if 'rnn_cell_type' not in cp['enc_params']: cp['enc_params']['rnn_cell_type'] = 'rnn'
   enc = enc_fn(**cp['enc_params']); enc.load_state_dict(cp['enc_state'])
   dec = Decoder(**cp['dec_params']); dec.load_state_dict(cp['dec_state'])
   return enc, dec
@@ -705,41 +724,58 @@ def split_array_indices(M: int, N: int) -> List[np.ndarray[int]]:
 # ------------------------------------------------------------------------------------------------
 
 def main():
-  num_processes = 16
+  num_processes = 5
+  # num_processes = 0
+  task_type = 'mnist'
+  # task_type = 'logic'
+  is_cluster = False
+  base_p = '/scratch/naf264/explore-variational-rnn' if is_cluster else os.getcwd()
   do_train = True
   rand_ticks = True
-  do_save_results = False
+  do_save_results = True
   num_epochs = 100
-  batch_size = 100
-  task_type = 'mnist'
+  batch_size = 100 if task_type == 'mnist' else 1024
   
   # enc_hds = [32, 64, 128, 256, 512, 1024]
   # betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.]
   # max_num_ticks_set = [6]
 
-  enc_hds = [1024]
-  betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.]
-  max_num_ticks_set = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  enc_hds = [4, 8, 16, 32]
+  # betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.]
+  betas = [1e-4, 1e-3, 1e-2, 1e-1]
+  # betas = [0.]
+  # max_num_ticks_set = [x + 1 for x in range(16)]
+  max_num_ticks_set = [2, 4, 6, 8]
+  seeds = [x + 61 for x in range(5)]
+
+  # debug logic task
+  # seeds = seeds[:1]
+  # enc_hds = [512]
+  # max_num_ticks_set = [10]
+  # betas = [0.]
 
   nb = 1 if do_train else len(betas)
   ns = 1 if do_train else len(max_num_ticks_set)
+  nss = 1 if do_train else len(seeds)
 
   # loading all of the model combinations for evaluation is too memory intensive, do it in batches.
   bi = split_array_indices(len(betas), nb)
   si = split_array_indices(len(max_num_ticks_set), ns)
-  ei = [*itertools.product(bi, si)]
+  ssi = split_array_indices(len(seeds), nss)
+  ei = [*itertools.product(bi, si, ssi)]
 
   for i, e in enumerate(ei):
     print(f'{i+1} of {len(ei)}', flush=True)
 
-    b, s = e
+    b, s, seed_ = e
     bs = [betas[b] for b in b]
     ss = [max_num_ticks_set[s] for s in s]
+    seed_ = [seeds[s] for s in seed_]
 
     set_fn, arg_sets = prepare(
       do_train=do_train, betas=bs, enc_hds=enc_hds, max_num_ticks_set=ss,
       rand_ticks=rand_ticks, num_epochs=num_epochs, batch_size=batch_size, 
-      task_type=task_type, do_save_results=do_save_results)
+      task_type=task_type, do_save_results=do_save_results, base_p=base_p, seeds=seed_)
 
     run(set_fn, arg_sets, num_processes)
 
@@ -758,12 +794,9 @@ def run(set_fn, arg_sets, num_processes: int):
 def prepare(
   *, do_train: bool, betas: List[float], enc_hds: List[int], 
   max_num_ticks_set: List[int], rand_ticks: bool, num_epochs: int, 
-  batch_size: int, task_type: str, do_save_results: bool):
+  batch_size: int, task_type: str, do_save_results: bool, base_p: str, seeds: List[int]):
   """
   """
-  base_p = '/scratch/naf264/explore-variational-rnn'
-  # base_p = os.getcwd()
-
   root_p = os.path.join(base_p, 'data')
   res_p = os.path.join(base_p, 'results')
 
@@ -775,20 +808,26 @@ def prepare(
   do_show_plots = False
   is_recurrent = True
   eval_epochs = [*np.arange(0, num_epochs, 10)] + [num_epochs-1]
+  use_lr_sched = True
+  lr = 1e-4
   # eval_epochs = eval_epochs[-1:]
   
   if task_type == 'logic':
-    K = 1024
+    use_lr_sched = False
+    lr = 1e-3
+    rnn_cell_type = 'rnn'
+    K = 2
     full_cov = False
     nc = 2
     num_ops = 10
     input_dim = num_ops * 10 + 2
-    seq_len = 3
+    seq_len = 1
     ldp = {'batch_size': batch_size, 'seq_len': seq_len, 'num_ops': num_ops}
-    data_train = DataLoader(LogicDataset(**ldp, num_samples=60_000), batch_size=batch_size)
+    data_train = DataLoader(LogicDataset(**ldp, num_samples=10_000), batch_size=batch_size)
     data_test = DataLoader(LogicDataset(**ldp, num_samples=10_000), batch_size=batch_size)
 
   elif task_type == 'parity':
+    rnn_cell_type = 'rnn'
     K = 4
     full_cov = False
     nc = 2
@@ -798,6 +837,7 @@ def prepare(
     data_test = DataLoader(ParityDataset(10_000, input_dim), batch_size=batch_size)
 
   elif task_type == 'mnist':
+    rnn_cell_type = 'rnn'
     K = 2
     full_cov = True
     nc = 10
@@ -807,13 +847,13 @@ def prepare(
     data_test = make_mnist_dataloader(
       datasets.mnist.MNIST(root_p, download=True, train=False, transform=ToTensor()), batch_size)
 
-  p = [*itertools.product(betas, max_num_ticks_set, enc_hds, [0] if do_train else eval_epochs)]
+  p = [*itertools.product(betas, max_num_ticks_set, enc_hds, seeds, [0] if do_train else eval_epochs)]
 
   arg_sets = []
   for ip, cmb in enumerate(p):
     print(f'{ip+1} of {len(p)}', flush=True)
 
-    beta, max_num_ticks, enc_hd, epoch = cmb
+    beta, max_num_ticks, enc_hd, seed, epoch = cmb
 
     hp = {}
     hp['task_type'] = task_type
@@ -825,11 +865,14 @@ def prepare(
     hp['epoch'] = epoch
     hp['encoder_hidden_dim'] = enc_hd
     hp['rand_ticks'] = rand_ticks
+    hp['seed'] = seed
     beta_str = f'{beta:0.4f}' if beta >= 1e-4 else str(beta)
 
     cp_name = f'checkpoint-beta_{beta_str}-full_cov_{full_cov}-recurrent_{is_recurrent}' + \
               f'-rand_ticks_{rand_ticks}-max_ticks_{max_num_ticks}-task_type_{task_type}'
-    if not enc_hd == 1024: cp_name = f'{cp_name}-enc_hd_{enc_hd}'
+    if enc_hd != 1024: cp_name = f'{cp_name}-enc_hd_{enc_hd}'
+    if seed != _NO_RANDOM_SEED: cp_name = f'{cp_name}-seed_{seed}'
+    if rnn_cell_type != 'rnn': cp_name = f'{cp_name}-rnn_{rnn_cell_type}'
     if do_train:
       cp_p = os.path.join(root_p, f'{cp_name}.pth')
     else:
@@ -840,11 +883,14 @@ def prepare(
     enc_fn = RecurrentEncoder if is_recurrent else Encoder
     interface = ModelInterface(
       forward=forward_recurrent if is_recurrent else forward,
-      encoder_params=RecurrentEncoderParams(max_num_ticks) if is_recurrent else EncoderParams()
+      encoder_params=RecurrentEncoderParams(max_num_ticks) if is_recurrent else EncoderParams(),
+      random_seed=seed
     )
 
     if do_train:
-      enc = enc_fn(K=K, full_cov=full_cov, input_dim=input_dim, hidden_dim=enc_hd, beta=beta)
+      enc = enc_fn(
+        K=K, full_cov=full_cov, input_dim=input_dim, hidden_dim=enc_hd, beta=beta, 
+        rnn_cell_type=rnn_cell_type)
       dec = Decoder(K=K, nc=nc)
     else:
       cp = torch.load(cp_p)
@@ -854,7 +900,8 @@ def prepare(
 
     if do_train:
       arg_sets.append((
-        interface, enc, dec, num_epochs, data_train, data_test, root_p, cp_name, do_save_results
+        interface, enc, dec, num_epochs, data_train, data_test, root_p, cp_name, do_save_results,
+        use_lr_sched, lr
       ))
     else:
       for id, ds in enumerate([data_test]):
