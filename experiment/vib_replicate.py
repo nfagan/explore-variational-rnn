@@ -735,17 +735,31 @@ def main():
   do_save_results = True
   num_epochs = 100
   batch_size = 100 if task_type == 'mnist' else 1024
+
+  if task_type == 'mnist':
+    # K = 2
+    # full_cov = True
+    K = 256
+    full_cov = False
+  elif task_type == 'logic':
+    K = 2
+    full_cov = False
+  elif task_type == 'parity':
+    K = 4
+    full_cov = False
+  else:
+    assert False, f'Unhandled task type: "{task_type}"'
   
   # enc_hds = [32, 64, 128, 256, 512, 1024]
   # betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.]
   # max_num_ticks_set = [6]
 
-  enc_hds = [4, 8, 16, 32]
+  # enc_hds = [1024]
   # betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.]
-  betas = [1e-4, 1e-3, 1e-2, 1e-1]
+  # betas = [1e-4, 1e-3, 1e-2, 1e-1]
   # betas = [0.]
   # max_num_ticks_set = [x + 1 for x in range(16)]
-  max_num_ticks_set = [2, 4, 6, 8]
+  # max_num_ticks_set = [2, 4, 6, 8]
   seeds = [x + 61 for x in range(5)]
 
   # debug logic task
@@ -753,6 +767,12 @@ def main():
   # enc_hds = [512]
   # max_num_ticks_set = [10]
   # betas = [0.]
+
+  # debug original mnist
+  enc_hds = [1024]
+  betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+  # max_num_ticks_set = [1, 2, 4, 6, 8]
+  max_num_ticks_set = [1]
 
   nb = 1 if do_train else len(betas)
   ns = 1 if do_train else len(max_num_ticks_set)
@@ -775,7 +795,8 @@ def main():
     set_fn, arg_sets = prepare(
       do_train=do_train, betas=bs, enc_hds=enc_hds, max_num_ticks_set=ss,
       rand_ticks=rand_ticks, num_epochs=num_epochs, batch_size=batch_size, 
-      task_type=task_type, do_save_results=do_save_results, base_p=base_p, seeds=seed_)
+      task_type=task_type, do_save_results=do_save_results, base_p=base_p, seeds=seed_,
+      K=K, full_cov=full_cov)
 
     run(set_fn, arg_sets, num_processes)
 
@@ -794,7 +815,8 @@ def run(set_fn, arg_sets, num_processes: int):
 def prepare(
   *, do_train: bool, betas: List[float], enc_hds: List[int], 
   max_num_ticks_set: List[int], rand_ticks: bool, num_epochs: int, 
-  batch_size: int, task_type: str, do_save_results: bool, base_p: str, seeds: List[int]):
+  batch_size: int, task_type: str, do_save_results: bool, base_p: str, seeds: List[int],
+  K: int, full_cov: bool):
   """
   """
   root_p = os.path.join(base_p, 'data')
@@ -816,8 +838,6 @@ def prepare(
     use_lr_sched = False
     lr = 1e-3
     rnn_cell_type = 'rnn'
-    K = 2
-    full_cov = False
     nc = 2
     num_ops = 10
     input_dim = num_ops * 10 + 2
@@ -828,8 +848,6 @@ def prepare(
 
   elif task_type == 'parity':
     rnn_cell_type = 'rnn'
-    K = 4
-    full_cov = False
     nc = 2
     input_dim = 64
     nc = 2
@@ -838,8 +856,6 @@ def prepare(
 
   elif task_type == 'mnist':
     rnn_cell_type = 'rnn'
-    K = 2
-    full_cov = True
     nc = 10
     input_dim = 784
     data_train = make_mnist_dataloader(
