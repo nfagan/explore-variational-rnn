@@ -4,7 +4,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --time=24:00:00
-#SBATCH --mem-per-cpu=16G
+#SBATCH --mem-per-cpu=24G
 
 module purge
 module load anaconda3/2024.02
