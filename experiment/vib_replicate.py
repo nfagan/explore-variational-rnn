@@ -592,9 +592,9 @@ def main():
   num_processes = 0
   task_type = 'mnist'
   # task_type = 'logic'
-  is_cluster = False
+  is_cluster = True
   base_p = '/scratch/naf264/explore-variational-rnn' if is_cluster else os.getcwd()
-  do_train = False
+  do_train = True
   rand_ticks = True
   do_save_results = True
   num_epochs = 100
