@@ -588,11 +588,11 @@ def split_array_indices(M: int, N: int) -> List[np.ndarray[int]]:
 # ------------------------------------------------------------------------------------------------
 
 def main():
-  # num_processes = 5
-  num_processes = 0
+  is_cluster = True
+  num_processes = 16 if is_cluster else 5
+  # num_processes = 0
   task_type = 'mnist'
   # task_type = 'logic'
-  is_cluster = True
   base_p = '/scratch/naf264/explore-variational-rnn' if is_cluster else os.getcwd()
   do_train = True
   rand_ticks = True
@@ -635,9 +635,10 @@ def main():
   # debug original mnist
   enc_hds = [1024]
   # betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
-  betas = [1e-9, 1e-8, 1e-7]
+  # betas = [1e-9, 1e-8, 1e-7]
+  betas = list(np.logspace(-2, -1, 16))
   # max_num_ticks_set = [1, 2, 4, 6, 8]
-  max_num_ticks_set = [1]
+  max_num_ticks_set = [1, 2, 4, 6, 8]
 
   nb = 1 if do_train else len(betas)
   ns = 1 if do_train else len(max_num_ticks_set)
