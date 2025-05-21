@@ -589,7 +589,7 @@ def split_array_indices(M: int, N: int) -> List[np.ndarray[int]]:
 
 def main():
   is_cluster = True
-  num_processes = 16 if is_cluster else 5
+  num_processes = 12 if is_cluster else 5
   # num_processes = 0
   task_type = 'mnist'
   # task_type = 'logic'
