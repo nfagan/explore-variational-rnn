@@ -292,7 +292,8 @@ def kl_full_gaussian(mu: torch.Tensor, L: torch.Tensor) -> torch.Tensor:
   return kl.sum()
 
 def forward_recurrent(
-  enc: RecurrentEncoder, dec: Decoder, xs: torch.Tensor, ys: torch.Tensor, enc_params: Dict):
+  enc: RecurrentEncoder, dec: Decoder, xs: torch.Tensor, ys: torch.Tensor, enc_params: Dict, 
+  num_z_eval=1):
   """"""
   def losses_per_tick(enc, dec, zs, mus, sigmas, ys):
     nt = zs.shape[-1]
@@ -318,17 +319,24 @@ def forward_recurrent(
     x = xs.select(-1, t)
     y = ys.select(-1, t)
 
-    zs, mus, sigmas, hx = enc(x, **enc_params, hx=hx)
-    # yhats = dec(zs)
+    if num_z_eval == 1:
+      zs, mus, sigmas, hx = enc(x, **enc_params, hx=hx)
+    else:
+      zs = []
+      for _ in range(num_z_eval):
+        zs_, mus, sigmas, hx_ = enc(x, **enc_params, hx=hx)
+        zs.append(zs_)
+      hx = hx_
+      zs = torch.mean(torch.stack(zs, dim=-1), dim=-1)
+
     yhats = dec(zs.select(-1, -1))
+    est = torch.argmax(yhats, dim=1).reshape(y.shape)
+    acc = torch.sum(est == y) / y.numel()
 
     L_kl = enc.kl(mus, sigmas)
     L_ce = F.cross_entropy(yhats, y, reduction='sum')
     L = L_ce + enc.beta * L_kl
     L /= batch_size
-
-    est = torch.argmax(yhats, dim=1).reshape(y.shape)
-    acc = torch.sum(est == y) / y.numel()
 
     kls, ces = losses_per_tick(enc, dec, zs, mus, sigmas, y)
 
@@ -510,6 +518,8 @@ def evaluate_ticks(
   batch_size = ims.shape[0]
   
   num_ticks = 16
+  num_mc_z_eval = 12  # from VIB paper
+
   accs = np.zeros((num_ticks,))
   errs = np.zeros_like(accs)
   mc_accs = np.zeros_like(accs)
@@ -520,23 +530,13 @@ def evaluate_ticks(
   for t in range(num_ticks):
     print(f'{t+1} of {num_ticks}')
     _, res = interface.forward(enc, dec, ims, ys, {'num_ticks': t+1})
+    _, mc_res = interface.forward(enc, dec, ims, ys, {'num_ticks': t+1}, num_z_eval=num_mc_z_eval)
+
     accs[t] = res['acc']
     errs[t] = res['err']
     pys[t] = res['yhat'].detach().cpu().squeeze(-1).numpy()
-
-    num_mc = 100
-    acc_mc = 0.
-    err_mc = 0.
-    if False:
-      for i in range(num_mc):
-        zs, mus, sigmas, _ = enc(ims, num_ticks=t+1)
-        yhats = dec(zs.select(-1, -1))
-        res = torch.multinomial(yhats, 1, True).squeeze(1)
-        tacc = (res == ys).sum() / res.shape[0]
-        acc_mc += tacc
-        err_mc += (1 - tacc)
-    mc_accs[t] = acc_mc / num_mc
-    mc_errs[t] = err_mc / num_mc
+    mc_accs[t] = mc_res['acc']
+    mc_errs[t] = mc_res['err']
   
   # evaluate with maximum ticks
   _, res = interface.forward(enc, dec, ims, ys, {'num_ticks': num_ticks})
@@ -562,23 +562,25 @@ def evaluate_ticks(
     mis[1, t] = hy - res['L_ce_per_tick'][t] / batch_size  # I(Z; Y)
 
     L = res['sigmas'].select(-1, t)
-    cov = L @ L.transpose(-1, -2)
-    covs[0, t] = cov[:, 0, 0].abs().mean()
-    covs[1, t] = cov[:, -1, -1].abs().mean()
-    covs[2, t] = cov[:, 1, 0].abs().mean()
-    tmp_areas = np.zeros((cov.shape[0],))
 
-    for i in range(cov.shape[0]):
-      eigvals, eigvecs = np.linalg.eigh(cov.select(0, i).detach().cpu().numpy())
-      width, height = 2 * np.sqrt(eigvals)
-      mn, mx = min(width, height), max(width, height)
-      tmp_areas[i] = np.pi * width * height
-      areas[0, t] += np.pi * width * height
-      anisos[0, t] += abs(1. - mx/mn)
+    if enc.full_cov:
+      cov = L @ L.transpose(-1, -2)
+      covs[0, t] = cov[:, 0, 0].abs().mean()
+      covs[1, t] = cov[:, -1, -1].abs().mean()
+      covs[2, t] = cov[:, 1, 0].abs().mean()
+      tmp_areas = np.zeros((cov.shape[0],))
 
-    med_areas[0, t] = np.median(tmp_areas)
-    areas[0, t] /= cov.shape[0]
-    anisos[0, t] /= cov.shape[0]
+      for i in range(cov.shape[0]):
+        eigvals, eigvecs = np.linalg.eigh(cov.select(0, i).detach().cpu().numpy())
+        width, height = 2 * np.sqrt(eigvals)
+        mn, mx = min(width, height), max(width, height)
+        tmp_areas[i] = np.pi * width * height
+        areas[0, t] += np.pi * width * height
+        anisos[0, t] += abs(1. - mx/mn)
+
+      med_areas[0, t] = np.median(tmp_areas)
+      areas[0, t] /= cov.shape[0]
+      anisos[0, t] /= cov.shape[0]
 
   if ctx.show_plot or ctx.do_save:
     plotting.plot_line(ticks, errs * 100., 'Ticks', 'Error (%)', context=ctx)
@@ -724,13 +726,13 @@ def split_array_indices(M: int, N: int) -> List[np.ndarray[int]]:
 # ------------------------------------------------------------------------------------------------
 
 def main():
-  num_processes = 5
-  # num_processes = 0
+  # num_processes = 5
+  num_processes = 0
   task_type = 'mnist'
   # task_type = 'logic'
   is_cluster = False
   base_p = '/scratch/naf264/explore-variational-rnn' if is_cluster else os.getcwd()
-  do_train = True
+  do_train = False
   rand_ticks = True
   do_save_results = True
   num_epochs = 100
@@ -770,7 +772,8 @@ def main():
 
   # debug original mnist
   enc_hds = [1024]
-  betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+  # betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+  betas = [1e-9, 1e-8, 1e-7]
   # max_num_ticks_set = [1, 2, 4, 6, 8]
   max_num_ticks_set = [1]
 
