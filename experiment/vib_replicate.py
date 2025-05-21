@@ -206,60 +206,6 @@ class RecurrentEncoder(nn.Module):
 
 # ------------------------------------------------------------------------------------------------
 
-class Encoder(nn.Module):
-  def __init__(self, *, input_dim: int, K: int, full_cov: bool, beta: float):
-    super().__init__()
-
-    num_distribution_params = K + (2 ** K) - 1 if full_cov else 2 * K
-
-    self.mlp = nn.Sequential(
-      nn.Linear(input_dim, 1024),
-      nn.ReLU(),
-      nn.Linear(1024, 1024),
-      nn.ReLU(),
-      nn.Linear(1024, num_distribution_params),
-      # nn.ReLU()
-    )
-    self.K = K #  bottleneck size
-    self.full_cov = full_cov
-    self.beta = beta
-    self.input_dim = input_dim
-
-  def ctor_params(self): return {
-    'K': self.K, 'full_cov': self.full_cov, 'input_dim': self.input_dim, 'beta': self.beta
-  }    
-
-  def kl(self, mus: torch.Tensor, L_or_sigma: torch.Tensor):
-    if self.full_cov:
-      return kl_full_gaussian(mus, L_or_sigma)
-    else:
-      return kl_diagonal_gaussian(mus, L_or_sigma)
-
-  def forward(self, x):
-    fe = self.mlp(x)
-    mus = fe[:, :self.K]
-
-    if self.full_cov:
-      # build Cholesky factor
-      sigmas = fe[:, self.K:]
-      L = torch.zeros((x.shape[0], self.K, self.K))
-      tril_indices = torch.tril_indices(self.K, self.K, 0)
-      L[:, tril_indices[0], tril_indices[1]] = sigmas
-      # softplus on diagonal
-      diag_idx = torch.arange(self.K)
-      L[:, diag_idx, diag_idx] = F.softplus(L[:, diag_idx, diag_idx])
-      # covariance and sample
-      # cov = L @ L.transpose(-1, -2)
-      eps = torch.randn_like(mus).unsqueeze(-1)
-      z = mus.unsqueeze(-1) + L @ eps
-      return z.squeeze(-1), mus, L
-    else:
-      mus = fe[:, :self.K]
-      sigmas = F.softplus(fe[:, self.K:] - 5.)
-      eps = torch.randn_like(sigmas)
-      z = eps * sigmas + mus
-      return z, mus, sigmas
-
 class Decoder(nn.Module):
   def __init__(self, *, K: int, nc: int):
     super().__init__()
@@ -361,31 +307,6 @@ def forward_recurrent(
 
   return seq_L, addtl
 
-def forward(enc: Encoder, dec: Decoder, ims: torch.Tensor, ys: torch.Tensor, enc_params: Dict):
-  batch_size = ims.shape[0]
-
-  zs, mus, sigmas = enc(ims, **enc_params)
-  yhats = dec(zs)
-
-  L_kl = enc.kl(mus, sigmas)
-  L_ce = F.cross_entropy(yhats, ys, reduction='sum')
-  L = L_ce + enc.beta * L_kl
-  L /= batch_size
-
-  est = torch.argmax(yhats, dim=1).reshape(ys.shape)
-  acc = torch.sum(est == ys) / ys.numel()
-
-  addtl = {}
-  addtl['acc'] = acc
-  addtl['err'] = 1. - acc
-  addtl['zs'] = zs
-  addtl['mus'] = mus
-  addtl['sigmas'] = sigmas
-  addtl['L_kl'] = L_kl
-  addtl['L_ce'] = L_ce
-
-  return L, addtl
-
 # ------------------------------------------------------------------------------------------------
 
 def make_mnist_dataloader(mnist, batch_size: int):
@@ -416,7 +337,7 @@ def make_batch(mnist, si: torch.Tensor = None):
   return ims, ys
 
 def eval_train(
-  interface: ModelInterface, enc: Encoder, dec: Decoder, data_test: DataLoader, enc_p: dict):
+  interface: ModelInterface, enc: RecurrentEncoder, dec: Decoder, data_test: DataLoader, enc_p: dict):
   """"""
   enc.eval()
   dec.eval()
@@ -430,7 +351,7 @@ def eval_train(
   return L_eval, eval_acc
 
 def train(
-  interface: ModelInterface, enc: Encoder, dec: Decoder, 
+  interface: ModelInterface, enc: RecurrentEncoder, dec: Decoder, 
   num_epochs: int, data: DataLoader, data_test: DataLoader, 
   cp_p: str, cp_name: str, do_save: bool, use_lr_sched: bool, lr: float):
   """"""
@@ -636,65 +557,6 @@ def evaluate_ticks(
 
   return out
 
-def evaluate(
-  interface: ModelInterface, enc: Encoder, dec: Decoder, 
-  mnist_test, mnist_train, ctx: plotting.PlotContext):
-  """"""
-  enc.eval()
-  dec.eval()
-
-  eval_ims, eval_ys = make_batch(mnist_test)
-  _, eval_res = interface.forward(enc, dec, eval_ims, eval_ys, interface.encoder_params.get())
-  err_test = eval_res["err"] * 100.
-
-  ims, ys = make_batch(mnist_train)
-  _, train_res = interface.forward(enc, dec, ims, ys, interface.encoder_params.get())
-  err_train = train_res["err"] * 100.
-  print(f'train error: {err_train:.3f}% | test error: {err_test:.3f}%')
-
-  if enc.full_cov:
-    pi = torch.randperm(min(eval_ys.shape[0], 1000))
-    mus = eval_res['mus'].index_select(0, pi)
-    sigmas = eval_res['sigmas'].index_select(0, pi)
-
-    if len(mus.shape) == 2:
-      mus = mus.unsqueeze(2)
-      sigmas = sigmas.unsqueeze(3)
-
-    nt = mus.shape[-1]
-    fig = plt.figure(1); fig.clf()
-    axs = plotting.panels(nt)
-
-    for i in range(nt):
-      ax = axs[i]
-
-      lims = [-20, 20]
-      dec_entropy = eval_classif_entropy(dec, lims[0], lims[1], 256)
-      de = dec_entropy; de = (de - de.min()) / (de.max() - de.min())
-      # if True: de = 1. - de
-
-      cmap = plt.get_cmap('hsv', dec.nc)(np.arange(dec.nc))[:, :3]
-      class_bounds = eval_classif(dec, lims[0], lims[1], 256, cmap)
-
-      # bg_im = class_bounds
-      # bg_im = de
-      
-      # when entropy is low, 1 - de is close to 1, so the color is bright.
-      # when entropy is high, 1 - de is close to 0, so the color is darker.
-      lp = 0.125
-      bg_im = class_bounds * (lp + (1. - lp) * (1. - de[:, :, None]))
-
-      L = sigmas.select(-1, i)
-      cov = L @ L.transpose(-1, -2)
-
-      plotting.plot_embeddings(ax, mus.select(-1, i), cov, eval_ys[pi], cmap)
-      plotting.plot_image(ax, lims, lims, bg_im, cmap='gray')
-      ax.set_xlim(lims)
-      ax.set_ylim(lims)
-      ax.set_title(f'test error: {err_test:.3f}%')
-    fig.set_figwidth(15); fig.set_figheight(15)
-    plotting.maybe_save_fig('classif', context=ctx)
-
 def make_checkpoint(enc, dec):
   cp = {
     'enc_state': enc.state_dict(), 'dec_state': dec.state_dict(), 
@@ -899,9 +761,9 @@ def prepare(
       cp_p = os.path.join(root_p, f'{cp_name}.pth')
       if not os.path.exists(cp_p): print(f'No such file: {cp_name}'); continue
 
-    enc_fn = RecurrentEncoder if is_recurrent else Encoder
+    enc_fn = RecurrentEncoder
     interface = ModelInterface(
-      forward=forward_recurrent if is_recurrent else forward,
+      forward=forward_recurrent,
       encoder_params=RecurrentEncoderParams(max_num_ticks) if is_recurrent else EncoderParams(),
       random_seed=seed
     )
