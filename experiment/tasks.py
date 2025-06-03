@@ -35,7 +35,6 @@ def generate_addition_task_sequence(
   """
   x = torch.zeros((max_num_digits * 10, seq_len))
   y = torch.zeros((max_num_digits + 1, seq_len), dtype=torch.long)
-  # y = torch.zeros((max_num_digits * 11, seq_len)) # +1 for "end of number"
 
   seq_mask = torch.ones((seq_len, 1))
   seq_mask[0] = 0
@@ -44,16 +43,14 @@ def generate_addition_task_sequence(
     num_digits = 1 + torch.randint(0, max_num_digits, (1,))
     for d in range(num_digits):
       digit = torch.randint(0, 10, (1,))
-      x[i*10:(i+1)*10, i] = nn.functional.one_hot(digit, 10)
+      x[d*10:(d+1)*10, i] = nn.functional.one_hot(digit, 10)
       s = digit if i == 0 else s + digit
       ss = str(s.item())
       r = len(ss)
       for k in range(r):
         y[k, i] = int(ss[k])
-        # y[k*11:(k+1)*11, i] = nn.functional.one_hot(torch.tensor(int(ss[k])), 11)
       for k in range((max_num_digits + 1) - r):
         y[k+r, i] = 10
-        # y[(k+r)*11:(k+r+1)*11, i] = nn.functional.one_hot(torch.tensor(10), 11)
   return x.T, y.T, seq_mask
 
 """
@@ -62,6 +59,7 @@ Logic task
 
 # Define the list of operations in fixed order.
 ops_list = ['NOR', 'Xq', 'ABJ', 'XOR', 'NAND', 'AND', 'XNOR', 'if/then', 'then/if', 'OR']
+# ops_list = ['AND']
 
 # Define the operations as functions mapping (x,y) in {0,1} x {0,1} -> {0,1}
 ops = {
@@ -72,8 +70,8 @@ ops = {
   'NAND':   lambda x, y: 1 if not (x and y) else 0,
   'AND':    lambda x, y: int(x and y),
   'XNOR':   lambda x, y: 1 if x == y else 0,
-  'if/then':lambda x, y: int((not x) or y),
-  'then/if':lambda x, y: int((not y) or x),
+  'if/then':lambda x, y: y if x else True,
+  'then/if':lambda x, y: x if y else True,
   'OR':     lambda x, y: int(x or y)
 }
 
@@ -91,7 +89,7 @@ def generate_logic_task_examplar(b0, num_ops):
   chunks = []
   for i in range(num_ops):
     if i < B:
-      op_index = random.randint(0, 9)
+      op_index = random.randint(0, len(ops_list)-1)
       one_hot = [0] * 10
       one_hot[op_index] = 1
       chunks.extend(one_hot)
@@ -100,7 +98,7 @@ def generate_logic_task_examplar(b0, num_ops):
       chunks.extend([0] * 10)
   
   # 4. Assemble the full input vector (first two elements are b1 and b0, then the 10 chunks).
-  input_vec = [float(b1), float(b0)] + [float(x) for x in chunks]  # total length 2 + 100 = 102
+  input_vec = [float(b0), float(b1)] + [float(x) for x in chunks]  # total length 2 + 100 = 102
 
   # 5. Compute the target by recursively applying the operations.
   b_prev = b0
@@ -144,6 +142,7 @@ def generate_logic_task_sequence(seq_len, num_ops):
   for i in range(seq_len):
     b0 = random.randint(0, 1) if i == 0 else int(targets[-1][0])
     inp, tgt = generate_logic_task_examplar(b0, num_ops)
+    if i == 0: inp[0] = float(b0)
     inputs.append(inp)
     targets.append([float(tgt)])  # wrap target so that its shape is (1,)
     

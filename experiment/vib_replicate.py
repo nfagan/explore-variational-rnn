@@ -588,12 +588,16 @@ def split_array_indices(M: int, N: int) -> List[np.ndarray[int]]:
 # ------------------------------------------------------------------------------------------------
 
 def main():
-  is_cluster = True
+  is_cluster = False
+
   num_processes = 4 if is_cluster else 5
   # num_processes = 0
   task_type = 'mnist'
   # task_type = 'logic'
-  base_p = '/scratch/naf264/explore-variational-rnn' if is_cluster else os.getcwd()
+  # local_p = '/Volumes/external4/data/mattarlab/explore-variational-rnn'
+  local_p = os.getcwd()
+  cluster_p = '/scratch/naf264/explore-variational-rnn'
+  base_p = cluster_p if is_cluster else local_p
   do_train = True
   rand_ticks = True
   do_save_results = True
@@ -613,32 +617,12 @@ def main():
     full_cov = False
   else:
     assert False, f'Unhandled task type: "{task_type}"'
-  
-  # enc_hds = [32, 64, 128, 256, 512, 1024]
-  # betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.]
-  # max_num_ticks_set = [6]
 
-  # enc_hds = [1024]
-  # betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 0.]
-  # betas = [1e-4, 1e-3, 1e-2, 1e-1]
-  # betas = [0.]
-  # max_num_ticks_set = [x + 1 for x in range(16)]
-  # max_num_ticks_set = [2, 4, 6, 8]
   seeds = [x + 61 for x in range(5)]
-
-  # debug logic task
-  # seeds = seeds[:1]
-  # enc_hds = [512]
-  # max_num_ticks_set = [10]
-  # betas = [0.]
-
-  # debug original mnist
   enc_hds = [1024]
-  # betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
-  # betas = [1e-9, 1e-8, 1e-7]
-  betas = list(np.logspace(-2, -1, 16))
-  # max_num_ticks_set = [1, 2, 4, 6, 8]
-  max_num_ticks_set = [1, 2, 4, 6, 8]
+  betas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+  max_num_ticks_set = [x + 1 for x in range(10)]
+  # betas = list(np.logspace(-2, -1, 16))
 
   nb = 1 if do_train else len(betas)
   ns = 1 if do_train else len(max_num_ticks_set)
