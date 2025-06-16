@@ -75,19 +75,23 @@ ops = {
   'OR':     lambda x, y: int(x or y)
 }
 
-def generate_logic_task_examplar(b0, num_ops):
+def generate_logic_task_examplar(b0: int, max_num_ops: int, fixed_num_ops = None):
   """
   """
   # 1. Sample the two initial binary numbers.
   b1 = random.randint(0, 1)
   
   # 2. Decide how many operations B to apply (from 1 to 10).
-  B = random.randint(1, num_ops)
+  if fixed_num_ops is not None:
+    assert fixed_num_ops <= max_num_ops
+    B = fixed_num_ops
+  else:
+    B = random.randint(1, max_num_ops)
   
   # 3. Prepare the 10 chunks of size 10.
   # For the first B chunks, set a one-hot encoding for a randomly chosen operation (index 0 to 9).
   chunks = []
-  for i in range(num_ops):
+  for i in range(max_num_ops):
     if i < B:
       op_index = random.randint(0, len(ops_list)-1)
       one_hot = [0] * 10
@@ -104,6 +108,8 @@ def generate_logic_task_examplar(b0, num_ops):
   b_prev = b0
   b_curr = b1
 
+  intermediates = []
+
   # accumulator = b1
   # For each of the first B chunks, decode the one-hot into an operation index.
   # We iterate over chunks in order.
@@ -116,8 +122,12 @@ def generate_logic_task_examplar(b0, num_ops):
     op_name = ops_list[op_index]
     # Update the accumulator.
     res = ops[op_name](b_curr, b_prev)
+    intermediates.append((op_index, b_curr, b_prev, res, B))
     b_prev, b_curr = b_curr, res
     # accumulator = ops[op_name](accumulator, b0)
+
+  for _ in range(max_num_ops - B):
+    intermediates.append((-1, -1, -1, -1, B))
 
   if True:
     """
@@ -127,9 +137,9 @@ def generate_logic_task_examplar(b0, num_ops):
     input_vec[0] = 0
   
   target = b_curr
-  return input_vec, target
+  return input_vec, target, torch.tensor(intermediates)
 
-def generate_logic_task_sequence(seq_len, num_ops):
+def generate_logic_task_sequence(seq_len: int, num_ops: int, fixed_num_ops = None):
   """
   Generate a batch of examples for the ACT logic task.
   
@@ -139,21 +149,23 @@ def generate_logic_task_sequence(seq_len, num_ops):
   """
   inputs = []
   targets = []
+  intermediates = []
   for i in range(seq_len):
     b0 = random.randint(0, 1) if i == 0 else int(targets[-1][0])
-    inp, tgt = generate_logic_task_examplar(b0, num_ops)
+    inp, tgt, ints = generate_logic_task_examplar(b0, num_ops, fixed_num_ops)
     if i == 0: inp[0] = float(b0)
     inputs.append(inp)
     targets.append([float(tgt)])  # wrap target so that its shape is (1,)
+    intermediates.append(ints)
     
   inputs = torch.tensor(inputs, dtype=torch.float)
   targets = torch.tensor(targets, dtype=torch.float)
-  return inputs, targets
+  return inputs, targets, torch.stack(intermediates, dim=-1)
 
 if __name__ == '__main__':
   seq_len = 2
   num_ops = 2
-  inputs, targets = generate_logic_task_sequence(seq_len, num_ops)
+  inputs, targets, _ = generate_logic_task_sequence(seq_len, num_ops)
   print("Input examples (each row is a 102-dimensional vector):")
   print(inputs, inputs.shape)
   print("Targets:")
