@@ -386,17 +386,17 @@ def evaluate(
   hps['num_fixed_ticks'] = -1
   hps['seq_len'] = 3
 
-  if True:
+  if False:
     # evaluate generalization performance when sequences are longer than those seen during training
     if hps['task_type'] == 'logic':
       for i in range(3):
         slen = 4 + i
         hp_res = {**hps}
         hp_res['seq_len'] = slen
-        data_prep = prepare_logic_task(batch_size=10_000, num_ops=10, fixed_num_ops=None, seq_len=slen)
+        data_prep = prepare_logic_task(batch_size=5_000, num_ops=10, fixed_num_ops=None, seq_len=slen)
         evaluate_(ctx, enc, foward_fn, data_prep, loss_fn, train_epoch, hp_res)
 
-  if False:
+  if True:
     # decode hidden state representation(s) of output
     if hps['task_type'] == 'logic':
       hp_res = {**hps}
@@ -406,7 +406,7 @@ def evaluate(
         matname = GenCPFnameFn(hp_res, True)(train_epoch).replace('.pth', '.mat')
         savemat(os.path.join(ctx.save_p, 'decoding', matname), decode_res)
 
-  if False:
+  if True:
     # evaluate performance when varying example difficulty
     if hps['task_type'] == 'logic':
       num_ops = [*np.arange(0, 10, 2)] + [9]
@@ -417,7 +417,7 @@ def evaluate(
         hps_fixed['fixed_num_ops'] = i + 1
         evaluate_(ctx, enc, foward_fn, data_prep, loss_fn, train_epoch, hps_fixed)
 
-  if False:
+  if True:
     # (default) evaluate performance for classifying `data`
     hps_dflt = {**hps}
     evaluate_(ctx, enc, foward_fn, data, loss_fn, train_epoch, hps_dflt)
@@ -629,18 +629,17 @@ def main():
   bottleneck_Ks = [512]
 
   betas = [0, 1e-2, 1e-1, 2e-2, 3e-2]
-  # betas = [1e-2*(1/2), 1e-2*(1/3), 1e-2*(1/4)]
+  betas += [1e-2*(1/2), 1e-2*(1/3), 1e-2*(1/4)]
   # betas = [1e-2*(1/6), 1e-2*(1/8), 1e-2*(1/10)]
 
-  # --- just one
-  eval_epochs = [ eval_epochs[-1] ]
-  # seeds = [ seeds[0] ]
-  # ponder_costs = [ ponder_costs[0] ]
-  # eval_epochs = [ eval_epochs[0] ]
-  # --- just one
+  # --- several
+  eval_epochs = eval_epochs[::2]
 
+  # --- just one
+  # eval_epochs = [ eval_epochs[-1] ]
+
+  # --- train, instead of eval
   # eval_epochs = [None]
-  # ponder_costs = [1e-3 * 1]
 
   its = [*product(seeds, eval_epochs, ponder_costs, betas, bottleneck_Ks)]
   arg_sets = []
