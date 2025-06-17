@@ -492,18 +492,19 @@ def kl_div(mus: torch.Tensor, sigs: torch.Tensor):
   return s / mus.shape[-1]
 
 class TrainCBFn(object):
-  def __init__(self, *, do_save: bool, cp_save_interval: int, gen_cp_fname_fn, hps: dict):
+  def __init__(self, *, do_save: bool, cp_save_interval: int, gen_cp_fname_fn, hps: dict, root_p: str):
     self.do_save = do_save
     self.cp_save_interval = cp_save_interval
     self.gen_cp_fname_fn = gen_cp_fname_fn
     self.hps = hps
+    self.root_p = root_p
 
   def __call__(self, enc, e: int):
     if not self.do_save: return
     if e % self.cp_save_interval != 0: return
     cp_fname = self.gen_cp_fname_fn(e)
     cp = {'state': enc.state_dict(), 'hps': self.hps}
-    torch.save(cp, os.path.join(os.getcwd(), 'data', cp_fname))
+    torch.save(cp, os.path.join(self.root_p, 'data', cp_fname))
 
 class GenCPFnameFn(object):
   def __init__(self, hps: dict, eval_mode: bool):
@@ -528,7 +529,7 @@ class ForwardFn(object):
 
 class LossFn(object):
   def __init__(self, *, ponder_cost: float, beta: float, weight_normalization_type: str):
-    assert weight_normalization_type in ['norm', 'none']
+    assert weight_normalization_type in ['norm', 'none', 'sums_to_1']
     self.ponder_cost = ponder_cost
     self.beta = beta
     self.weight_normalization_type = weight_normalization_type
@@ -543,6 +544,8 @@ class LossFn(object):
       weights /= np.linalg.norm(weights)
     elif self.weight_normalization_type == 'none':
       pass
+    elif self.weight_normalization_type == 'sums_to_1':
+      weights /= np.sum(weights)
     else: assert False
     # return L_acc + ponder_cost*L_ponder + beta*L_kl
     return weights[0]*L_acc + weights[1]*L_ponder + weights[2]*L_kl
@@ -550,7 +553,7 @@ class LossFn(object):
 def prepare(
   *, ponder_cost: float, do_save: bool, step_type: str, num_fixed_ticks: int, hps: dict,
   data_train: DataLoader, input_dim: int, nc: int, eval_epoch: int, bottleneck_K: int, beta: float, 
-  M: int, weight_normalization_type: str):
+  M: int, weight_normalization_type: str, root_p: str):
   """"""
   cp_save_interval = 2000
   rnn_hidden_dim = hps['rnn_hidden_dim'] = 512
@@ -574,7 +577,8 @@ def prepare(
     enc.load_state_dict(cp['state'])
 
   train_cb_fn = TrainCBFn(
-    do_save=do_save, cp_save_interval=cp_save_interval, gen_cp_fname_fn=gen_cp_fname_fn, hps=hps)
+    do_save=do_save, cp_save_interval=cp_save_interval, gen_cp_fname_fn=gen_cp_fname_fn, 
+    hps=hps, root_p=root_p)
   forward_fn = ForwardFn(step_type=step_type, num_fixed_ticks=num_fixed_ticks, M=M)
   loss_fn = LossFn(ponder_cost=ponder_cost, beta=beta, weight_normalization_type=weight_normalization_type)
 
@@ -613,14 +617,17 @@ def run(set_fn, arg_sets, num_processes: int):
     for p in processes: p.join()
 
 def main():
+  # root_p = os.getcwd()
+  root_p = '/scratch/naf264/explore-variational-rnn/'
+
   eval_batch_size = 10_000
   num_train_epochs = 30_001
   do_save = True
-  num_processes = 0
+  num_processes = 12
 
   M = 20
-  weight_normalization_type = 'none'
-  # weight_normalization_type = 'norm'
+  # weight_normalization_type = 'none'
+  weight_normalization_type = 'sums_to_1'
   seeds = [61, 62, 63, 64, 65]
   eval_epochs = list(np.arange(0, num_train_epochs, 2_000))
   # ponder_costs = [1e-3 * 0.5, 1e-3 * 1, 1e-3 * 2, 1e-3 * 3, 1e-3 * 4]
@@ -633,13 +640,13 @@ def main():
   # betas = [1e-2*(1/6), 1e-2*(1/8), 1e-2*(1/10)]
 
   # --- several
-  eval_epochs = eval_epochs[::2]
+  # eval_epochs = eval_epochs[::2]
 
   # --- just one
   # eval_epochs = [ eval_epochs[-1] ]
 
   # --- train, instead of eval
-  # eval_epochs = [None]
+  eval_epochs = [None]
 
   its = [*product(seeds, eval_epochs, ponder_costs, betas, bottleneck_Ks)]
   arg_sets = []
@@ -669,12 +676,13 @@ def main():
       ponder_cost=ponder_cost, do_save=do_save,
       step_type=step_type, num_fixed_ticks=num_fixed_ticks, hps=hps,
       data_train=data_train, nc=nc, input_dim=input_dim, eval_epoch=eval_epoch,
-      bottleneck_K=bottleneck_K, beta=beta, M=M, weight_normalization_type=weight_normalization_type
+      bottleneck_K=bottleneck_K, beta=beta, M=M, 
+      weight_normalization_type=weight_normalization_type, root_p=root_p
     )
 
     if eval_epoch is not None: # evaluate
       hps['epoch'] = eval_epoch
-      eval_ctx = EvaluateContext(save_p=os.path.join(os.getcwd(), 'results'), do_save=do_save)
+      eval_ctx = EvaluateContext(save_p=os.path.join(root_p, 'results'), do_save=do_save)
       arg_sets.append((eval_ctx, enc, forward_fn, data_train, loss_fn, eval_epoch, hps))
     else:
       arg_sets.append((enc, forward_fn, data_train, loss_fn, train_cb_fn, num_train_epochs, lr, seed))
