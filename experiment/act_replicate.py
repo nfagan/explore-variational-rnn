@@ -22,6 +22,7 @@ from dataclasses import dataclass
 class EvaluateContext:
   save_p: str
   do_save: bool
+  default_batch_size: int
 
 class AdditionDataset(Dataset):
   def __init__(self, *, seq_len: int, max_num_digits: int, batch_size: int):
@@ -277,6 +278,12 @@ class RecurrentClassifier(nn.Module):
 
 # ------------------------------------------------------------------------------------------------
 
+def fix_dict_for_matfile(d: dict):
+  d = {**d}
+  for k in d:
+    if d[k] is None: d[k] = -1.
+  return d
+
 def make_cp_id(hps: dict):
   cp_id = str(hps).replace("'", '').replace(': ', '_')
   cp_id = cp_id.replace('{', '').replace('}', '').replace(', ', '-')
@@ -333,8 +340,8 @@ def do_evaluate(enc: RecurrentClassifier, foward_fn, data: DataLoader, loss_fn):
     L = loss_fn(y, ys, p, addtl)
     return {'acc': seq_acc.item(), 'err_rate': err_rate.item(), 'ticks': n.float().mean().item()}, addtl
   
-def decode_internal_reprs_logic_task(enc: RecurrentClassifier, foward_fn, loss_fn):
-  data_prep = prepare_logic_task(batch_size=10_000, num_ops=10, fixed_num_ops=None)
+def decode_internal_reprs_logic_task(enc: RecurrentClassifier, foward_fn, loss_fn, batch_size: int):
+  data_prep = prepare_logic_task(batch_size=batch_size, num_ops=10, fixed_num_ops=None)
   _, addtl = do_evaluate(enc, foward_fn, data_prep, loss_fn)
   last_ticki = addtl['n'][:, -1]  # last step of sequence
   last_h = addtl['h'][-1]
@@ -377,62 +384,47 @@ def decode_internal_reprs_logic_task(enc: RecurrentClassifier, foward_fn, loss_f
     'n': addtl['n'].detach().cpu().numpy(), 
     'pred_ys': class_pred_ys, 'intermediates': ints.detach().cpu().numpy()}
   return rd
-  
-def evaluate(
-  ctx: EvaluateContext, enc: RecurrentClassifier, foward_fn, data: DataLoader, 
-  loss_fn, train_epoch: int, hps: dict):
-  """"""
-  hps = {**hps}
-  hps['num_fixed_ticks'] = -1
-  hps['seq_len'] = 3
 
-  if False:
-    # evaluate generalization performance when sequences are longer than those seen during training
-    if hps['task_type'] == 'logic':
-      for i in range(3):
-        slen = 4 + i
-        hp_res = {**hps}
-        hp_res['seq_len'] = slen
-        data_prep = prepare_logic_task(batch_size=5_000, num_ops=10, fixed_num_ops=None, seq_len=slen)
-        evaluate_(ctx, enc, foward_fn, data_prep, loss_fn, train_epoch, hp_res)
-
-  if True:
-    # decode hidden state representation(s) of output
-    if hps['task_type'] == 'logic':
+def evaluate_generalization(
+  ctx: EvaluateContext, enc: RecurrentClassifier, forward_fn, loss_fn, train_epoch: int, hps: dict):
+  # evaluate generalization performance when sequences are longer than those seen during training
+  if hps['task_type'] == 'logic':
+    for i in range(3):
+      slen = 4 + i
       hp_res = {**hps}
-      decode_res = decode_internal_reprs_logic_task(enc, foward_fn, loss_fn)
-      decode_res['hps'] = hp_res
-      if ctx.do_save:
-        matname = GenCPFnameFn(hp_res, True)(train_epoch).replace('.pth', '.mat')
-        savemat(os.path.join(ctx.save_p, 'decoding', matname), decode_res)
+      hp_res['seq_len'] = slen
+      data_prep = prepare_logic_task(
+        batch_size=ctx.default_batch_size, num_ops=10, fixed_num_ops=None, seq_len=slen)
+      evaluate_baseline(ctx, enc, forward_fn, data_prep, loss_fn, train_epoch, hp_res)
 
-  if True:
-    # evaluate performance when varying example difficulty
-    if hps['task_type'] == 'logic':
-      num_ops = [*np.arange(0, 10, 2)] + [9]
-      for i in num_ops:
-        print(f'{i+1} of {len(num_ops)}')
-        data_prep = prepare_logic_task(batch_size=10_000, num_ops=10, fixed_num_ops=i+1)
-        hps_fixed = {**hps}
-        hps_fixed['fixed_num_ops'] = i + 1
-        evaluate_(ctx, enc, foward_fn, data_prep, loss_fn, train_epoch, hps_fixed)
+def evaluate_hidden_representations(
+  ctx: EvaluateContext, enc: RecurrentClassifier, forward_fn, loss_fn, train_epoch: int, hps: dict):
+  # decode hidden state representation(s) of output
+  if hps['task_type'] == 'logic':
+    hp_res = {**hps}
+    decode_res = decode_internal_reprs_logic_task(enc, forward_fn, loss_fn, ctx.default_batch_size)
+    decode_res['hps'] = fix_dict_for_matfile(hp_res)
+    if ctx.do_save:
+      matname = GenCPFnameFn(hp_res, True)(train_epoch).replace('.pth', '.mat')
+      savemat(os.path.join(ctx.save_p, 'decoding', matname), decode_res)
 
-  if True:
-    # (default) evaluate performance for classifying `data`
-    hps_dflt = {**hps}
-    evaluate_(ctx, enc, foward_fn, data, loss_fn, train_epoch, hps_dflt)
+def evaluate_varying_difficulty(
+  ctx: EvaluateContext, enc: RecurrentClassifier, forward_fn, loss_fn, train_epoch: int, hps: dict):
+  # evaluate performance when varying example difficulty
+  if hps['task_type'] == 'logic':
+    print('Example difficulty ...')
+    num_ops = [*np.arange(0, 10, 2)] + [9]
+    for it, i in enumerate(num_ops):
+      print(f'\t{it+1} of {len(num_ops)}')
+      data_prep = prepare_logic_task(batch_size=ctx.default_batch_size, num_ops=10, fixed_num_ops=i+1)
+      hps_fixed = {**hps}
+      hps_fixed['fixed_num_ops'] = i + 1
+      evaluate_baseline(ctx, enc, forward_fn, data_prep, loss_fn, train_epoch, hps_fixed)
 
-def evaluate_(
-  ctx: EvaluateContext, enc: RecurrentClassifier, foward_fn, data: DataLoader, 
+def evaluate_fixed_ticks(
+  ctx: EvaluateContext, enc: RecurrentClassifier, forward_fn, data: DataLoader, 
   loss_fn, train_epoch: int, hps: dict):
   """"""
-  hp_res = {**hps}
-  hp_res['num_fixed_ticks'] = -1
-  res, _ = do_evaluate(enc, foward_fn, data, loss_fn)
-  res['hps'] = hp_res
-  if ctx.do_save:
-    savemat(os.path.join(ctx.save_p, GenCPFnameFn(hp_res, True)(train_epoch).replace('.pth', '.mat')), res)
-
   for t in [*np.arange(0, 16, 2)]:
     num_fixed_ticks = t + 1
     for st in ['fixed', 'fixed-act']:
@@ -442,9 +434,35 @@ def evaluate_(
       hp_res['step_type'] = st
       hp_res['num_fixed_ticks'] = num_fixed_ticks
       save_fname = GenCPFnameFn(hp_res, True)(train_epoch).replace('.pth', '.mat')
-      res['hps'] = hp_res
+      res['hps'] = fix_dict_for_matfile(hp_res)
       if ctx.do_save:
         savemat(os.path.join(ctx.save_p, save_fname.replace('.pth', '.mat')), res)
+  
+def evaluate(
+  ctx: EvaluateContext, enc: RecurrentClassifier, forward_fn, data: DataLoader, 
+  loss_fn, train_epoch: int, hps: dict):
+  """"""
+  hps = {**hps}
+  hps['num_fixed_ticks'] = -1
+  hps['seq_len'] = 3
+
+  if True: evaluate_baseline(ctx, enc, forward_fn, data, loss_fn, train_epoch, {**hps})
+  if True: evaluate_varying_difficulty(ctx, enc, forward_fn, loss_fn, train_epoch, hps)
+  if False: evaluate_generalization(ctx, enc, forward_fn, loss_fn, train_epoch, hps)
+  if False: evaluate_hidden_representations(ctx, enc, forward_fn, loss_fn, train_epoch, hps)
+  if False: evaluate_fixed_ticks(ctx, enc, forward_fn, data, loss_fn, train_epoch, {**hps})
+
+def evaluate_baseline(
+  ctx: EvaluateContext, enc: RecurrentClassifier, forward_fn, data: DataLoader, 
+  loss_fn, train_epoch: int, hps: dict):
+  """"""
+  print('Baseline ...')
+  hp_res = {**hps}
+  hp_res['num_fixed_ticks'] = -1
+  res, _ = do_evaluate(enc, forward_fn, data, loss_fn)
+  res['hps'] = fix_dict_for_matfile(hp_res)
+  if ctx.do_save:
+    savemat(os.path.join(ctx.save_p, GenCPFnameFn(hp_res, True)(train_epoch).replace('.pth', '.mat')), res)
 
 # ------------------------------------------------------------------------------------------------
 
@@ -506,6 +524,14 @@ class TrainCBFn(object):
     cp = {'state': enc.state_dict(), 'hps': self.hps}
     torch.save(cp, os.path.join(self.root_p, 'data', cp_fname))
 
+class GravesGenCPFnameFn(object):
+  def __init__(self, hps: dict):
+    self.hps = {k: hps[k] for k in ['ponder_cost', 'step_type', 'task_type']}
+
+  def __call__(self, e: int):
+    res = f'act-checkpoint-{make_cp_id(self.hps)}-{e}.pth'
+    return res
+
 class GenCPFnameFn(object):
   def __init__(self, hps: dict, eval_mode: bool):
     self.hps = hps
@@ -527,7 +553,23 @@ class ForwardFn(object):
   def __call__(self, enc: RecurrentClassifier, xs: torch.Tensor): 
     return enc(xs, step_type=self.step_type, num_fixed_ticks=self.num_fixed_ticks, M=self.M)
 
-class LossFn(object):
+class GravesLossFn(object):
+  def __init__(self, *, ponder_cost: float):
+    self.ponder_cost = ponder_cost
+    self.reduction = 'sum'
+    # self.reduction = 'mean'
+
+  def __call__(self, y, ys, p, addtl: dict):
+    L_acc = nn.functional.cross_entropy(y, ys, reduction=self.reduction)
+    if self.reduction == 'sum':
+      L_ponder = torch.sum(p)
+    else:
+      assert self.reduction == 'mean'
+      L_ponder = torch.mean(p)
+    res = L_acc + L_ponder * self.ponder_cost
+    return res
+
+class VariationalLossFn(object):
   def __init__(self, *, ponder_cost: float, beta: float, weight_normalization_type: str):
     assert weight_normalization_type in ['norm', 'none', 'sums_to_1']
     self.ponder_cost = ponder_cost
@@ -548,12 +590,13 @@ class LossFn(object):
       weights /= np.sum(weights)
     else: assert False
     # return L_acc + ponder_cost*L_ponder + beta*L_kl
-    return weights[0]*L_acc + weights[1]*L_ponder + weights[2]*L_kl
+    res = weights[0]*L_acc + weights[1]*L_ponder + weights[2]*L_kl
+    return res
 
 def prepare(
   *, ponder_cost: float, do_save: bool, step_type: str, num_fixed_ticks: int, hps: dict,
   data_train: DataLoader, input_dim: int, nc: int, eval_epoch: int, bottleneck_K: int, beta: float, 
-  M: int, weight_normalization_type: str, root_p: str):
+  M: int, weight_normalization_type: str, root_p: str, use_graves_loss_fn: bool):
   """"""
   cp_save_interval = 2000
   rnn_hidden_dim = hps['rnn_hidden_dim'] = 512
@@ -569,18 +612,27 @@ def prepare(
     rnn_cell_type=rnn_cell_type, nc=nc, bottleneck_K=bottleneck_K
   )
   
-  gen_cp_fname_fn = GenCPFnameFn(hps, False)
+  if use_graves_loss_fn: 
+    gen_cp_fname_fn = GravesGenCPFnameFn(hps)
+  else:
+    gen_cp_fname_fn = GenCPFnameFn(hps, False)
 
   if eval_epoch is not None:
     enc.eval()
-    cp = torch.load(os.path.join(os.getcwd(), 'data', gen_cp_fname_fn(eval_epoch)))
+    cp = torch.load(os.path.join(root_p, 'data', gen_cp_fname_fn(eval_epoch)))
     enc.load_state_dict(cp['state'])
 
   train_cb_fn = TrainCBFn(
     do_save=do_save, cp_save_interval=cp_save_interval, gen_cp_fname_fn=gen_cp_fname_fn, 
     hps=hps, root_p=root_p)
   forward_fn = ForwardFn(step_type=step_type, num_fixed_ticks=num_fixed_ticks, M=M)
-  loss_fn = LossFn(ponder_cost=ponder_cost, beta=beta, weight_normalization_type=weight_normalization_type)
+
+  if use_graves_loss_fn:
+    loss_fn = GravesLossFn(ponder_cost=ponder_cost)
+  else:
+    loss_fn = VariationalLossFn(
+      ponder_cost=ponder_cost, beta=beta, weight_normalization_type=weight_normalization_type
+    )
 
   args = (enc, forward_fn, data_train, loss_fn, train_cb_fn, gen_cp_fname_fn)
   return args
@@ -617,36 +669,58 @@ def run(set_fn, arg_sets, num_processes: int):
     for p in processes: p.join()
 
 def main():
-  # root_p = os.getcwd()
-  root_p = '/scratch/naf264/explore-variational-rnn/'
-
-  eval_batch_size = 10_000
-  num_train_epochs = 30_001
+  # --- program hps
+  root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/graves-replicate'
+  # root_p = '/Volumes/external4/data/mattarlab/explore-variational-rnn/act'
+  # root_p = '/scratch/naf264/explore-variational-rnn/'
   do_save = True
-  num_processes = 12
+  # num_processes = 12
+  num_processes = 0
+  replicate_graves = True
+  # --- program hps
 
+  # --- network / training hps
+  train_batch_size = 32
+  # eval_batch_size = 10_000
+  eval_batch_size = 5_000
+  num_train_epochs = 30_001
+  step_type = 'act'
+  # step_type = 'non-mf-act'
+  num_fixed_ticks = 6 # @NOTE: This isn't used unless step_type == 'fixed'
+  lr = 1e-3
   M = 20
   # weight_normalization_type = 'none'
   weight_normalization_type = 'sums_to_1'
-  seeds = [61, 62, 63, 64, 65]
-  eval_epochs = list(np.arange(0, num_train_epochs, 2_000))
   # ponder_costs = [1e-3 * 0.5, 1e-3 * 1, 1e-3 * 2, 1e-3 * 3, 1e-3 * 4]
   # ponder_costs = [1e-3 * 2, 1e-3 * 3, 1e-2]
   ponder_costs = [1e-3 * 1]
   bottleneck_Ks = [512]
+  betas = [0, 1e-2, 1e-1, 2e-2, 3e-2] + [1e-2*(1/2), 1e-2*(1/3)]
+  # --- network / training hps
 
-  betas = [0, 1e-2, 1e-1, 2e-2, 3e-2]
-  betas += [1e-2*(1/2), 1e-2*(1/3), 1e-2*(1/4)]
-  # betas = [1e-2*(1/6), 1e-2*(1/8), 1e-2*(1/10)]
+  seeds = [61, 62, 63, 64, 65]
+  eval_epochs = list(np.arange(0, num_train_epochs, 2_000))
 
   # --- several
   # eval_epochs = eval_epochs[::2]
 
   # --- just one
-  # eval_epochs = [ eval_epochs[-1] ]
+  eval_epochs = [ eval_epochs[-1] ]
 
   # --- train, instead of eval
-  eval_epochs = [None]
+  # eval_epochs = [None]
+
+  # --- override params for replication
+  if replicate_graves:
+    bottleneck_Ks = [None]
+    betas = [0.]
+    train_batch_size = 16
+    # ponder_costs = [1e-3, 1e-2, 1e-1]
+    ponder_costs = [1e-3, 2e-3, 4e-3, 6e-3, 8e-3]
+    seeds = [61]
+    lr = 1e-3
+    M = 100
+  # --- override params for replication
 
   its = [*product(seeds, eval_epochs, ponder_costs, betas, bottleneck_Ks)]
   arg_sets = []
@@ -658,12 +732,8 @@ def main():
     hps = {}
 
     task_type = hps['task_type'] = 'logic'
-    train_batch_size = hps['batch_size'] = 32
+    train_batch_size = hps['batch_size'] = train_batch_size
     seed = hps['seed'] = seed
-    step_type = 'act'
-    # step_type = 'non-mf-act'
-    num_fixed_ticks = 6
-    lr = 1e-3
     hps['bottleneck_K'] = bottleneck_K
     hps['beta'] = beta
     hps['M'] = M
@@ -677,12 +747,14 @@ def main():
       step_type=step_type, num_fixed_ticks=num_fixed_ticks, hps=hps,
       data_train=data_train, nc=nc, input_dim=input_dim, eval_epoch=eval_epoch,
       bottleneck_K=bottleneck_K, beta=beta, M=M, 
-      weight_normalization_type=weight_normalization_type, root_p=root_p
+      weight_normalization_type=weight_normalization_type, root_p=root_p,
+      use_graves_loss_fn=replicate_graves
     )
 
     if eval_epoch is not None: # evaluate
       hps['epoch'] = eval_epoch
-      eval_ctx = EvaluateContext(save_p=os.path.join(root_p, 'results'), do_save=do_save)
+      res_p = os.path.join(root_p, 'results')
+      eval_ctx = EvaluateContext(save_p=res_p, do_save=do_save, default_batch_size=eval_batch_size)
       arg_sets.append((eval_ctx, enc, forward_fn, data_train, loss_fn, eval_epoch, hps))
     else:
       arg_sets.append((enc, forward_fn, data_train, loss_fn, train_cb_fn, num_train_epochs, lr, seed))
