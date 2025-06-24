@@ -13,7 +13,7 @@ from tasks import generate_logic_task_sequence, generate_addition_task_sequence
 import os, random, string
 from itertools import product
 from multiprocessing import Process
-from typing import List
+from typing import List, Union
 from dataclasses import dataclass
 
 # ------------------------------------------------------------------------------------------------
@@ -75,6 +75,175 @@ class LogicDataset(Dataset):
     return x, y, intermediates
 
 # ------------------------------------------------------------------------------------------------
+
+class VRNNClassifier(nn.Module):
+  def __init__(
+    self, *, input_dim: int, hidden_dim: int, rnn_cell_type: str, nc: int, bottleneck_K: int):
+    """"""
+    # assert rnn_cell_type == 'rnn' # @TODO, enable other cell types
+
+    super().__init__()
+    self.input_dim = input_dim
+    self.hidden_dim = hidden_dim
+    self.rnn_cell_type = rnn_cell_type
+    self.nc = nc
+    self.K = bottleneck_K
+    self.encode_cell_state = rnn_cell_type == 'lstm' and True # and False
+    self.enable_bottleneck = True
+
+    encode_mul = 2 if self.encode_cell_state else 1
+
+    self.hidden_state_to_encoder_params = nn.Linear(hidden_dim * encode_mul, 2 * bottleneck_K)
+    self.latent_to_hidden_state = nn.Linear(bottleneck_K, hidden_dim * encode_mul)
+    self.hidden_state_to_output = nn.Linear(hidden_dim, nc)
+    self.halt = nn.Linear(hidden_dim, 1)
+    
+    if rnn_cell_type == 'rnn': self.rnn = nn.RNNCell(input_dim, hidden_dim)
+    elif rnn_cell_type == 'lstm': self.rnn = nn.LSTMCell(input_dim, hidden_dim)
+    else: assert False
+
+  def extract_cell_states(self, sn):
+    h = sn[0] if self.rnn_cell_type == 'lstm' else sn
+    c = sn[1] if self.encode_cell_state else None
+    return h, c
+
+  def update_cell_state(self, h, c, sn):
+    if self.rnn_cell_type == 'rnn': sn = h
+    elif self.encode_cell_state: sn = (h, c)
+    else: sn = (h, sn[1])
+    return sn
+
+  def compute_latent_to_hidden_state(self, z: torch.Tensor):
+    nonlin_on_h = True # make False to return to LSTM variant
+    h = self.latent_to_hidden_state(z)
+    if nonlin_on_h: h = torch.tanh(h)
+    if self.encode_cell_state:
+      c = h[:, self.hidden_dim:]
+      if not nonlin_on_h: c = torch.tanh(c)
+      h = h[:, :self.hidden_dim]
+    else:
+      c = None
+    return h, c
+
+  def compute_z(self, h: torch.Tensor, c: torch.Tensor = None):
+    if c is not None: h = torch.cat([h, c], dim=-1)
+    enc_p = self.hidden_state_to_encoder_params(h)
+    mus = enc_p[:, :self.K]
+    sigmas = F.softplus(enc_p[:, self.K:] - 5.)
+    eps = torch.randn_like(sigmas)
+    z = eps * sigmas + mus
+    return z, mus, sigmas
+  
+  def fixed_ticks_step(self, sx: torch.Tensor, xi: torch.Tensor, num_ticks: int):
+    """"""
+    sn = sx
+    hs = []
+    
+    for _ in range(num_ticks):
+      sn = self.rnn(xi, sn)
+      h, c = self.extract_cell_states(sn)
+      z, mus, sigmas = self.compute_z(h, c)
+      if self.enable_bottleneck: h, c = self.compute_latent_to_hidden_state(z)
+      y = self.hidden_state_to_output(h)
+      sn = self.update_cell_state(h, c, sn)
+      hs.append(h)
+
+    pt = torch.zeros((xi.shape[0],))
+    yt = y
+    sx = sn
+    nt = torch.ones((xi.shape[0],), dtype=torch.int64) * num_ticks
+    hs = torch.stack(hs, dim=-1)
+
+    addtl = {'z': z, 'mus': mus, 'sigmas': sigmas, 'h': hs}
+
+    return sx, yt, pt, nt, addtl
+
+  def act_step(self, xi: torch.Tensor, sx: torch.Tensor, eps_halting: float, M: int):
+    """"""
+    sn = sx
+    pt = 0. # cumuluative halting probability
+    p_hist = []
+    y_hist = []
+    s_hist = []
+    c_hist = []
+    keep_processing = torch.ones((xi.shape[0],), dtype=bool)
+    n = 0
+    while n < M:
+      if not keep_processing.any(): break
+      sn = self.rnn(xi, sn)
+      h, c = self.extract_cell_states(sn)
+      z, mus, sigmas = self.compute_z(h, c)
+      if self.enable_bottleneck: h, c = self.compute_latent_to_hidden_state(z)
+      y = self.hidden_state_to_output(h)
+      pn = torch.sigmoid(self.halt(h)).squeeze(1)
+      sn = self.update_cell_state(h, c, sn)
+      pt += pn
+      p_hist.append(pn)
+      s_hist.append(h)
+      if self.rnn_cell_type == 'lstm': c_hist.append(c)
+      y_hist.append(y)
+      keep_processing[pt >= 1. - eps_halting] = False
+      n += 1
+
+    p_hist = torch.stack(p_hist, dim=-1)
+    y_hist = torch.stack(y_hist, dim=-1)
+    s_hist = torch.stack(s_hist, dim=-1)
+    if self.rnn_cell_type == 'lstm': c_hist = torch.stack(c_hist, dim=-1)
+
+    p_max = torch.min(torch.tensor(1.), torch.cumsum(p_hist, dim=-1))
+    p_max[:, -1] = 1.
+    ph = torch.cat([p_max[:, 0][:, None], torch.diff(p_max, dim=-1)], dim=-1)
+    # weight states and outputs by halting probabilities
+    st = torch.sum(ph.unsqueeze(1) * s_hist, dim=-1)
+    if self.rnn_cell_type == 'lstm': ct = torch.sum(ph.unsqueeze(1) * c_hist, dim=-1)
+    yt = torch.sum((ph.unsqueeze(-1) * y_hist.transpose(-1, -2)).transpose(-1, -2), dim=-1)
+    # determine the number of steps chosen per input
+    nt = torch.argmax(p_max, dim=1, keepdim=True).squeeze(1)
+    rt = 1. - p_max[torch.arange(p_max.shape[0]), nt-1]
+    # begin from the mean-field states for the next time-step
+    if self.rnn_cell_type == 'lstm': sx = (st, ct)
+    else: sx = st
+    pt = nt + rt
+
+    addtl = {'z': z, 'mus': mus, 'sigmas': sigmas, 'h': s_hist}
+
+    return sx, yt, pt, nt, addtl
+  
+  def forward(
+    self, x: torch.Tensor, sx: torch.Tensor = None, eps_halting = 1e-2, M = 14,
+    step_type: str = 'act', num_fixed_ticks: int = 6):
+    """
+    """
+    T = x.shape[-1]
+    P = []
+    Y = []
+    N = []
+    Addtl = {}
+
+    for t in range(T):
+      xi = x.select(-1, t)
+
+      if step_type == 'act':
+        sx, yt, pt, nt, addtl = self.act_step(xi, sx, eps_halting, M)
+      elif step_type == 'fixed':
+        sx, yt, pt, nt, addtl = self.fixed_ticks_step(sx, xi, num_fixed_ticks)
+      else: assert False
+
+      if t == 0: Addtl = {k: [] for v, k in enumerate(addtl)}
+      for k in addtl: Addtl[k].append(addtl[k])
+
+      # append to sequence
+      P.append(pt)
+      Y.append(yt)
+      N.append(nt)
+
+    P = torch.stack(P, dim=-1)
+    Y = torch.stack(Y, dim=-1)
+    N = torch.stack(N, dim=-1)
+    P = torch.sum(P, dim=-1)
+    for k in Addtl: 
+      if k != 'h': Addtl[k] = torch.stack(Addtl[k], dim=-1)
+    return Y, P, N, Addtl
 
 class RecurrentClassifier(nn.Module):
   def __init__(
@@ -186,7 +355,10 @@ class RecurrentClassifier(nn.Module):
 
     return sx, yt, pt, nt, addtl
 
-  def act_step(self, sx: torch.Tensor, xi: torch.Tensor, eps_halting: float, M: int, fixed_M: bool):
+  def act_step(
+    self, sx: torch.Tensor, xi: torch.Tensor, eps_halting: float, M: int, 
+    fixed_M: bool, non_mf_state: bool):
+    """"""
     sn = sx
     pt = 0. # cumuluative halting probability
     p_hist = []
@@ -224,6 +396,9 @@ class RecurrentClassifier(nn.Module):
     # determine the number of steps chosen per input
     nt = torch.argmax(p_max, dim=1, keepdim=True).squeeze(1)
     rt = 1. - p_max[torch.arange(p_max.shape[0]), nt-1]
+    if non_mf_state:
+      st = s_hist.select(-1, -1)
+      if self.rnn_cell_type == 'lstm': ct = c_hist.select(-1, -1)
     # begin from the mean-field states for the next time-step
     if self.rnn_cell_type == 'lstm': sx = (st, ct)
     else: sx = st
@@ -239,7 +414,8 @@ class RecurrentClassifier(nn.Module):
   def forward(
     self, x: torch.Tensor, sx: torch.Tensor = None, eps_halting = 1e-2, M = 14, 
     step_type: str = 'act', num_fixed_ticks: int = 6):
-    assert step_type in ['act', 'fixed', 'fixed-act', 'non-mf-act']
+    assert step_type in ['act', 'fixed', 'fixed-act', 'non-mf-act', 'act-non-mf-state']
+    act_step_types = ['act', 'fixed-act', 'act-non-mf-state']
 
     T = x.shape[-1]
     P = []
@@ -250,10 +426,11 @@ class RecurrentClassifier(nn.Module):
     for t in range(T):
       xi = x.select(-1, t)
 
-      if step_type == 'act' or step_type == 'fixed-act':
+      if step_type in act_step_types:
         fixed_M = step_type == 'fixed-act'
         use_M = num_fixed_ticks if fixed_M else M
-        sx, yt, pt, nt, addtl = self.act_step(sx, xi, eps_halting, use_M, fixed_M)
+        non_mf_state = step_type == 'act-non-mf-state'
+        sx, yt, pt, nt, addtl = self.act_step(sx, xi, eps_halting, use_M, fixed_M, non_mf_state)
       elif step_type == 'non-mf-act':
         sx, yt, pt, nt, addtl = self.non_mean_field_act_step(sx, xi, eps_halting, M)
       elif step_type == 'fixed':
@@ -299,8 +476,8 @@ def sequence_error_rate(ys: torch.Tensor, yh: torch.Tensor):
   return err_rate
 
 def train(
-  enc: RecurrentClassifier, foward_fn, data_train: DataLoader, 
-  loss_fn, epoch_cb, num_epochs: int, lr: float, random_seed: int):
+  enc: Union[RecurrentClassifier, VRNNClassifier], foward_fn, data_train: DataLoader, 
+  loss_fn, epoch_cb, num_epochs: int, lr: float, random_seed: int, gradient_clip: float):
   """"""
   torch.manual_seed(random_seed)
   optim = torch.optim.Adam([*enc.parameters()], lr=lr)
@@ -313,6 +490,7 @@ def train(
       optim.zero_grad()
       L = loss_fn(y, ys, p, addtl)
       L.backward()
+      if gradient_clip is not None: torch.nn.utils.clip_grad_norm_(enc.parameters(), 1.0)
       optim.step()
 
       nf = n.type(torch.float)
@@ -326,7 +504,7 @@ def train(
       
     epoch_cb(enc, e)
 
-def do_evaluate(enc: RecurrentClassifier, foward_fn, data: DataLoader, loss_fn):
+def do_evaluate(enc: Union[RecurrentClassifier, VRNNClassifier], foward_fn, data: DataLoader, loss_fn):
   for xs, ys, intermediates in data:
     y, p, n, addtl = foward_fn(enc, xs)
     addtl['n'] = n
@@ -340,7 +518,8 @@ def do_evaluate(enc: RecurrentClassifier, foward_fn, data: DataLoader, loss_fn):
     L = loss_fn(y, ys, p, addtl)
     return {'acc': seq_acc.item(), 'err_rate': err_rate.item(), 'ticks': n.float().mean().item()}, addtl
   
-def decode_internal_reprs_logic_task(enc: RecurrentClassifier, foward_fn, loss_fn, batch_size: int):
+def decode_internal_reprs_logic_task(
+  enc: Union[RecurrentClassifier, VRNNClassifier], foward_fn, loss_fn, batch_size: int):
   data_prep = prepare_logic_task(batch_size=batch_size, num_ops=10, fixed_num_ops=None)
   _, addtl = do_evaluate(enc, foward_fn, data_prep, loss_fn)
   last_ticki = addtl['n'][:, -1]  # last step of sequence
@@ -543,6 +722,15 @@ class GenCPFnameFn(object):
       res += ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8))
       res = f'{res}.pth'
     return res
+  
+class VRNNForwardFn(object):
+  def __init__(self, *, M: int, num_fixed_ticks: int, step_type: str):
+    self.M = M
+    self.num_fixed_ticks = num_fixed_ticks
+    self.step_type = step_type
+
+  def __call__(self, enc: VRNNClassifier, xs: torch.Tensor):
+    return enc(xs, num_fixed_ticks=self.num_fixed_ticks, M=self.M, step_type=self.step_type)
 
 class ForwardFn(object):
   def __init__(self, *, step_type: str, num_fixed_ticks: int, M: int):
@@ -595,22 +783,36 @@ class VariationalLossFn(object):
 
 def prepare(
   *, ponder_cost: float, do_save: bool, step_type: str, num_fixed_ticks: int, hps: dict,
-  data_train: DataLoader, input_dim: int, nc: int, eval_epoch: int, bottleneck_K: int, beta: float, 
-  M: int, weight_normalization_type: str, root_p: str, use_graves_loss_fn: bool):
+  data_train: DataLoader, input_dim: int, rnn_hidden_dim: int, 
+  nc: int, eval_epoch: int, bottleneck_K: int, beta: float, 
+  M: int, weight_normalization_type: str, root_p: str, use_graves_loss_fn: bool, 
+  model_type: str, rnn_cell_type: str):
   """"""
+
+  assert model_type in ['rvib', 'vrnn']
+
   cp_save_interval = 2000
-  rnn_hidden_dim = hps['rnn_hidden_dim'] = 512
-  rnn_cell_type = hps['rnn_cell_type'] = 'lstm'
+  rnn_hidden_dim = hps['rnn_hidden_dim'] = rnn_hidden_dim
+  rnn_cell_type = hps['rnn_cell_type'] = rnn_cell_type
 
   hps['ponder_cost'] = ponder_cost
   hps['num_fixed_ticks'] = num_fixed_ticks
   hps['step_type'] = step_type
-  # num_classif = nc // stride
+  hps['model_type'] = model_type
 
-  enc = RecurrentClassifier(
-    input_dim=input_dim, hidden_dim=rnn_hidden_dim,
-    rnn_cell_type=rnn_cell_type, nc=nc, bottleneck_K=bottleneck_K
-  )
+  if model_type == 'vrnn':
+    enc = VRNNClassifier(
+      input_dim=input_dim, hidden_dim=rnn_hidden_dim,
+      rnn_cell_type=rnn_cell_type, nc=nc, bottleneck_K=bottleneck_K
+    )
+    forward_fn = VRNNForwardFn(M=M, num_fixed_ticks=num_fixed_ticks, step_type=step_type)
+  elif model_type == 'rvib':
+    enc = RecurrentClassifier(
+      input_dim=input_dim, hidden_dim=rnn_hidden_dim,
+      rnn_cell_type=rnn_cell_type, nc=nc, bottleneck_K=bottleneck_K
+    )
+    forward_fn = ForwardFn(step_type=step_type, num_fixed_ticks=num_fixed_ticks, M=M)
+  else: assert False
   
   if use_graves_loss_fn: 
     gen_cp_fname_fn = GravesGenCPFnameFn(hps)
@@ -625,7 +827,6 @@ def prepare(
   train_cb_fn = TrainCBFn(
     do_save=do_save, cp_save_interval=cp_save_interval, gen_cp_fname_fn=gen_cp_fname_fn, 
     hps=hps, root_p=root_p)
-  forward_fn = ForwardFn(step_type=step_type, num_fixed_ticks=num_fixed_ticks, M=M)
 
   if use_graves_loss_fn:
     loss_fn = GravesLossFn(ponder_cost=ponder_cost)
@@ -673,42 +874,58 @@ def main():
   root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/graves-replicate'
   # root_p = '/Volumes/external4/data/mattarlab/explore-variational-rnn/act'
   # root_p = '/scratch/naf264/explore-variational-rnn/'
-  do_save = True
+  do_save = False
   # num_processes = 12
   num_processes = 0
-  replicate_graves = True
+  replicate_graves = False
   # --- program hps
 
   # --- network / training hps
+  grad_clip = None  # before 6/24/25
+  # grad_clip = 1.0 # on/after 6/24/25
+  model_type = 'vrnn'
+  # model_type = 'rvib'
+  rnn_cell_type = 'lstm'
+  # rnn_cell_type = 'rnn'
+  rnn_hidden_dim = 512
+
+  # rnn_cell_type = 'rnn'
+  # rnn_hidden_dim = 2048
+
   train_batch_size = 32
   # eval_batch_size = 10_000
   eval_batch_size = 5_000
-  num_train_epochs = 30_001
+  num_train_epochs = 110_001
   step_type = 'act'
-  # step_type = 'non-mf-act'
+  # step_type = 'fixed'
+  # step_type = 'act-non-mf-state'
   num_fixed_ticks = 6 # @NOTE: This isn't used unless step_type == 'fixed'
-  lr = 1e-3
-  M = 20
-  # weight_normalization_type = 'none'
-  weight_normalization_type = 'sums_to_1'
+  lr = 1e-4
+  M = 6
+  weight_normalization_type = 'none'
+  # weight_normalization_type = 'sums_to_1'
   # ponder_costs = [1e-3 * 0.5, 1e-3 * 1, 1e-3 * 2, 1e-3 * 3, 1e-3 * 4]
   # ponder_costs = [1e-3 * 2, 1e-3 * 3, 1e-2]
-  ponder_costs = [1e-3 * 1]
+  # ponder_costs = [1e-5]
+  ponder_costs = [1e-3]
   bottleneck_Ks = [512]
   betas = [0, 1e-2, 1e-1, 2e-2, 3e-2] + [1e-2*(1/2), 1e-2*(1/3)]
+  # betas = [0.]
+  betas = [1e-2]
   # --- network / training hps
 
   seeds = [61, 62, 63, 64, 65]
+  seeds = [seeds[0]]
   eval_epochs = list(np.arange(0, num_train_epochs, 2_000))
 
   # --- several
   # eval_epochs = eval_epochs[::2]
 
   # --- just one
-  eval_epochs = [ eval_epochs[-1] ]
+  # eval_epochs = [ eval_epochs[-1] ]
 
   # --- train, instead of eval
-  # eval_epochs = [None]
+  eval_epochs = [None]
 
   # --- override params for replication
   if replicate_graves:
@@ -716,7 +933,8 @@ def main():
     betas = [0.]
     train_batch_size = 16
     # ponder_costs = [1e-3, 1e-2, 1e-1]
-    ponder_costs = [1e-3, 2e-3, 4e-3, 6e-3, 8e-3]
+    # ponder_costs = [1e-3, 2e-3, 4e-3, 6e-3, 8e-3]
+    ponder_costs = [1e-3, 1e-2]
     seeds = [61]
     lr = 1e-3
     M = 100
@@ -745,19 +963,23 @@ def main():
     enc, forward_fn, data_train, loss_fn, train_cb_fn, gen_cp_fname_fn = prepare(
       ponder_cost=ponder_cost, do_save=do_save,
       step_type=step_type, num_fixed_ticks=num_fixed_ticks, hps=hps,
-      data_train=data_train, nc=nc, input_dim=input_dim, eval_epoch=eval_epoch,
+      data_train=data_train, nc=nc, 
+      input_dim=input_dim, rnn_hidden_dim=rnn_hidden_dim, eval_epoch=eval_epoch,
       bottleneck_K=bottleneck_K, beta=beta, M=M, 
       weight_normalization_type=weight_normalization_type, root_p=root_p,
-      use_graves_loss_fn=replicate_graves
+      use_graves_loss_fn=replicate_graves, model_type=model_type, rnn_cell_type=rnn_cell_type
     )
 
-    if eval_epoch is not None: # evaluate
+    if eval_epoch is not None: 
+      # evaluate
       hps['epoch'] = eval_epoch
       res_p = os.path.join(root_p, 'results')
       eval_ctx = EvaluateContext(save_p=res_p, do_save=do_save, default_batch_size=eval_batch_size)
       arg_sets.append((eval_ctx, enc, forward_fn, data_train, loss_fn, eval_epoch, hps))
     else:
-      arg_sets.append((enc, forward_fn, data_train, loss_fn, train_cb_fn, num_train_epochs, lr, seed))
+      # train
+      arg_sets.append((
+        enc, forward_fn, data_train, loss_fn, train_cb_fn, num_train_epochs, lr, seed, grad_clip))
 
   set_fn = train_set if eval_epoch is None else eval_set
   run(set_fn, arg_sets, num_processes)
