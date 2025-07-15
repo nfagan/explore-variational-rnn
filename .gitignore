@@ -2,3 +2,4 @@ __pycache__/
 plots/
 *.DS_Store
 checkpoints/
+output/

@@ -15,6 +15,24 @@ that beta > 1e-2 tends back towards beta = 0 wrt use of iterative processing.
 is that simple solutions represent the output statistics, whereas more 
 complex solutions learn the underlying algorithm.
 
+@TODO (6/16)
+
+1. Plot generalization performance. Hypothesize that longer sequences 
+reveal increasing gaps in performance-per-tick as beta increases.
+
+2. Plot performance over learning. Hypothesize that more constrained
+(higher beta) models take longer to learn to use recurrence and longer to
+reach peak performance.
+
+@TODO (6/17)
+
+* Replicate Graves' results with Graves' architecture, in particular the
+ponder-use.
+* Show the relative order of the terms of the loss (KL, acc, and ponder)
+* Use a ponder cost high enough to avoid saturating the number of ticks.
+* Drop sequence length and re-run with more complexity penalties between 
+[0, 0.01] and [0.03, 0.1].
+
 %}
 
 %%
@@ -22,18 +40,28 @@ complex solutions learn the underlying algorithm.
 addpath( '/Users/nick/source/matlab/cbrewer2/cbrewer2' );
 addpath( '/Users/nick/source/matlab/28790/colorspace' );
 
-%%
+%%  load main evaluation results
 
-fps = shared_utils.io.findmat( ...
-  '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/results' );
-fps = date_filter( fps, datetime('09-Jun-2025') );
-ts = load_eval_results( fps );
+subdirs = ["ponder-net-replicate", "ponder-net-single-tick", "ponder-net-retrain" ];
+root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/output';
 
-%%
+ts = {};
+for i = 1:numel(subdirs)
+% min_date = datetime( '09-Jun-2025' );
+min_date = datetime( '23-Jun-2025' );
 
-decode_fs = shared_utils.io.findmat( ...
-  '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/results/decoding' );
-decode_fs = date_filter( decode_fs, datetime('09-Jun-2025') );
+fps = shared_utils.io.findmat( fullfile(root_p, subdirs(i), 'results') );
+fps = date_filter_gt( fps, min_date );
+[ts{i}, hp_names] = load_eval_results( fps );
+ts{i}.subdir(:) = subdirs(i);
+end
+
+ts = vertcat( ts{:} );
+
+%%  load decoding results
+
+decode_fs = shared_utils.io.findmat( fullfile(root_p, 'results/decoding') );
+decode_fs = date_filter_gt( decode_fs, datetime('09-Jun-2025') );
 dts = load_decode_results( decode_fs );
 
 %
@@ -41,6 +69,100 @@ dts = load_decode_results( decode_fs );
 % dts.pred_ys (batch x tick x sequence x prediction_type[result, operation index])
 
 edts = evaluate_decoding_results( dts );
+
+%%  scatter complexity v ticks
+
+figure(1); clf; 
+
+% ------------------------------------------------------------------------
+m = true( rows(ts), 1 );
+m = m & ts.fixed_num_ops ~= -1;
+m = m & ismember( ts.beta, [0, 1e-3, 2e-3, 5e-3] );
+m = m & ts.beta ~= 0;
+m = m & ts.acc > 0.95;
+% ------------------------------------------------------------------------
+
+plt = sortrows( ts(m, :), {'num_fixed_ticks', 'ponder_cost', 'fixed_num_ops', 'lp'} );
+
+yv = "ponder_prior_loss";
+yv = "ticks";
+pv = ["ponder_cost", "bottleneck_K", "rnn_cell_type", "lp", "fixed_num_ops"]; 
+pv = setdiff( pv, "fixed_num_ops", 'stable' );
+gv = "beta"; 
+xv = "complexity_loss";
+sv = "fixed_num_ops";
+% sv = "ticks";
+
+color_fn = @(n) cbrewer2('oranges', n);
+axs = plots.summarized3( plt.(yv), [], plt(:, pv), plt(:, gv), plt(:, xv) ...
+  , AddPoints=1, ColorFunc=color_fn, type='scatter', Summarize=0 ...
+  , NumericX=1, PerPanelX=1, WarnMissingX=0, MarkerSize=32, XJitter=0 ...
+  , MarkerSizeSeries=norm01(plt{:, sv})*64+8 );
+
+if ( ~isempty(axs) ), ylabel( axs, plots.strip_underscore(yv) ); end
+if ( ~isempty(axs) && contains(yv, 'acc') ), ylim( axs, [0.5, 1] ); end
+% if ( ~isempty(axs) && contains(yvar, 'ticks') ), ylim( axs, [0, 22]); end
+
+%%  measures after learning
+
+figure(1); clf; 
+group_beta = true;
+over_difficulty = 1;
+
+% ------------------------------------------------------------------------
+m = true( rows(ts), 1 );
+% m = m & ts.acc > 0.95;
+% m = m & ts.step_type == 'act';
+% m = m & ts.seq_len == 3;
+% m = m & ts.epoch == max( ts.epoch );
+m = m & ts.model_type == 'vrnn';
+% m = m & ts.ponder_cost == 4e-3;
+% m = m & ts.rnn_cell_type == 'lstm';
+% m = m & ts.beta ~= 0;
+% m = m & ts.beta == 0;
+% m = m & ts.fixed_num_ops < 10;
+m = m & ts.subdir ~= "ponder-net-retrain";
+if ( over_difficulty )
+  m = m & ts.fixed_num_ops > 0;
+else
+  m = m & ts.fixed_num_ops == -1;
+end
+% m = m & ts.seed == 63;
+m = m & ts.weight_normalization_type == 'none';
+m = m & ts.lp == 0.2;
+m = m & ismember( ts.ponder_cost, [3e-2] );
+m = m & ismember( ts.beta, [0, 1e-3, 2e-3, 5e-3] );
+m = m & ts.fixed_num_ops ~= 10;
+% m = m & ismember( ts.beta, [0, 1e-3, 2e-3, 5e-3, 7e-3, 1e-2, 5e-2] );
+% m = m & ismember( ts.fixed_num_ops, [1, 5, 7, 10] );
+% ------------------------------------------------------------------------
+
+vs = {'num_fixed_ticks', 'ponder_cost', 'fixed_num_ops', 'lp', 'subdir'};
+plt = sortrows( ts(m, :), vs );
+plt.difficulty = plt.fixed_num_ops;
+plt.accuracy = plt.acc;
+
+% yvar = 'ticks';
+yvar = 'accuracy';
+% yvar = 'p_halt_rel_entropy';
+pv = ["ponder_cost", "bottleneck_K", "rnn_cell_type", "lp", "subdir"]; 
+gv = "beta"; 
+xv = "difficulty";
+color_fn = @(n) cbrewer2('oranges', n);
+if ( ~group_beta )
+  pv(pv == "ponder_cost") = "beta";
+  gv(gv == "beta") = "ponder_cost"; 
+  color_fn = @(n) cbrewer2('greens', n);
+end
+if ( over_difficulty ), plt_type = 'error-bar'; else, plt_type = 'bar'; end
+axs = plots.summarized3( plt.(yvar), [], plt(:, pv), plt(:, gv), plt(:, xv) ...
+  , AddPoints=1, ColorFunc=color_fn ...
+  , type=plt_type, NumericX=1 );
+
+if ( ~isempty(axs) ), ylabel( axs(1), plots.strip_underscore(yvar) ); end
+if ( ~isempty(axs) && contains(yvar, 'acc') ), ylim( axs, [0.5, 1.025] ); end
+if ( ~isempty(axs) && contains(yvar, 'ticks') ), ylim( axs, [6, 12] ); end
+if ( ~isempty(axs) && contains(xv, 'difficulty') ), xlim( axs, [0, 10] ); end
 
 %%  decoding accuracy in final hidden state
 
@@ -109,10 +231,10 @@ ylabel( plots.strip_underscore(yvar) );
 %%  ponder vs. acc
 
 figure(1); clf;
-m = ts.step_type == 'act' & ts.bottleneck_K > 0 & ts.fixed_num_ops == -1 & ...
+m = ts.step_type == 'act' & ts.fixed_num_ops == -1 & ...
   ts.epoch == max( ts.epoch );
 % m = m & ismember( ts.beta, [0, 1e-2, 1e-1] );
-m = m & ts.weight_normalization_type == 'none';
+% m = m & ts.weight_normalization_type == 'none';
 plt = sortrows( ts(m, :), {'epoch', 'ponder_cost'} );
 % pv = "beta"; gv = "ponder_cost"; xv = "ticks";
 pv = "ponder_cost"; gv = "beta"; xv = "ticks";
@@ -130,20 +252,17 @@ axs = plots.summarized3( plt.(yvar), [], plt(:, pv), plt(:, gv), plt(:, xv) ...
 ylabel( plots.strip_underscore(yvar) );
 % xlim( [1, 16] ); ylim( axs, [0, .3] );
 
-%%  measures after learning
+%%  measures with varying sequence length
 
 figure(2); clf;
 m = ts.step_type == 'act' & ts.epoch == max( ts.epoch ) & ...
   ts.bottleneck_K > 0 & ts.ponder_cost == 1e-3;
-m = m & ts.fixed_num_ops > 0;
-% m = m & ts.fixed_num_ops == -1;
-% m = m & ismember( ts.beta, [0, 1e-2, 2e-2, 3e-2, 1e-1] );
-% m = m & ismember( ts.beta, [0, 1e-2*0.5, 1e-2*(1/3), 1e-2*(1/4)] );
+m = m & ts.fixed_num_ops == -1;
 m = m & ts.weight_normalization_type == 'none';
-plt = sortrows( ts(m, :), {'num_fixed_ticks', 'ponder_cost', 'fixed_num_ops'} );
+plt = sortrows( ts(m, :), {'num_fixed_ticks', 'ponder_cost', 'fixed_num_ops', 'seq_len'} );
 yvar = 'ticks';
 % yvar = 'acc';
-xv = 'fixed_num_ops'; gv = 'beta'; pv = 'ponder_cost';
+xv = "seq_len"; gv = 'beta'; pv = ["ponder_cost", "fixed_num_ops",];
 plots.summarized3( plt.(yvar), [], plt(:, pv), plt(:, gv), plt(:, xv) ...
   , AddPoints=1, ColorFunc=@(n) cbrewer2('oranges', n) ...
   , type='bar', NumericX=0, UseBarX=1 );
@@ -152,15 +271,19 @@ ylabel( yvar );
 %%  accuracy with increasing # ticks, bottlenecked model, after learning
 
 figure(2); clf;
-m = ts.step_type == 'fixed' & ts.epoch == max( ts.epoch ) & ...
-  ts.bottleneck_K > 0 & ts.fixed_num_ops == -1;
+m = ts.epoch == max( ts.epoch ) & ts.bottleneck_K > 0 & ts.fixed_num_ops == -1;
+% m = m & ts.step_type ~= 'act';
+m = m & ts.step_type == 'fixed-act';
 m = m & ts.weight_normalization_type == 'none';
+m = m & ts.seq_len == 3;
 % m = m & ismember( ts.beta, [0, 1e-2, 2e-2, 3e-2, 1e-1] );
 plt = sortrows( ts(m, :), {'num_fixed_ticks', 'ponder_cost'} );
-plots.summarized3( ...
-    plt.acc, [], plt(:, 'ponder_cost'), plt(:, 'beta'), plt(:, 'num_fixed_ticks') ...
-  , AddPoints=0, ColorFunc=@(n) cbrewer2('oranges', n), Type='bar' ...
-  , NumericX=0, UseBarX=1 );
+axs = plots.summarized3( ...
+    plt.acc, [], plt(:, ["ponder_cost", "step_type"]), plt(:, 'beta'), plt(:, 'num_fixed_ticks') ...
+  , AddPoints=1, ColorFunc=@(n) cbrewer2('oranges', n), Type='error-bar' ...
+  , NumericX=0, UseBarX=0, MarkerSize=2 );
+ylabel( axs, 'acc' );
+set_fig_dims( gcf, get_dflt_fig_dims );
 
 %%  use of ticks or acc vs. # logic gates, bottlenecked model, after learning
 % aka "acc vs difficulty"
@@ -238,6 +361,13 @@ if ( ~isfield(hps, 'fixed_num_ops') ), hps.fixed_num_ops = -1; end
 if ( ~isfield(hps, 'weight_normalization_type') )
   hps.weight_normalization_type = 'norm'; 
 end
+if ( ~isfield(hps, 'seq_len') ), hps.seq_len = 3; end
+if ( ~isfield(hps, 'model_type') ), hps.model_type = 'rvib'; end
+if ( ~isfield(hps, 'loss_fn_type') ), hps.loss_fn_type = 'variational'; end
+if ( ~isfield(hps, 'eps_halting') ), hps.eps_halting = 1e-2; end
+if ( ~isfield(hps, 'lp') ), hps.lp = 0; end
+if ( ~isfield(hps, 'min_lp') ), hps.min_lp = -1; end
+
 end
 
 function dts = load_decode_results(decode_fs)
@@ -255,13 +385,22 @@ dts = vertcat( dts{:} );
 
 end
 
-function ts = load_eval_results(fps)
+function [ts, hp_fnames] = load_eval_results(fps)
 
 ts = {};
+hp_fnames = [];
 for i = 1:numel(fps)
   fprintf( '\n %d of %d', i, numel(fps) );
   res = load( fps{i} );
+
+  if ( ~isfield(res, 'accuracy_loss') ), res.accuracy_loss = -1; end
+  if ( ~isfield(res, 'complexity_loss') ), res.complexity_loss = -1; end
+  if ( ~isfield(res, 'ponder_prior_loss') ), res.ponder_prior_loss = -1; end
+
+  d = dir( fps{i} );
   res.hps = fixup_hps( res.hps );
+  hp_fnames = string( fieldnames(res.hps) );
+  res.hps.date = datetime( d.date );
   t = struct2table( res.hps );
   rest = struct2table( rmfield(res, 'hps') );
   t = [ t, rest ];
@@ -323,9 +462,28 @@ edts = vertcat( edts{:} );
 
 end
 
-function [fps, f] = date_filter(fps, dt_thresh)
+function [fps, f] = date_filter_gt(fps, dt_thresh)
 d = cellfun( @dir, fps );
 dt = datetime( {d.date} );
 f = dt > dt_thresh;
 fps = fps(f);
+end
+
+function set_fig_dims(f, wh)
+p = get( f, 'position' );
+p(3) = wh(1);
+p(4) = wh(2);
+set( f, 'position', p );
+end
+
+function wh = get_dflt_fig_dims()
+wh = [1056, 553];
+end
+
+function x = norm01(x)
+if ( numel(x) == 1 )
+  x = 0;
+else
+  x = (x - min(x)) ./ (max(x) - min(x));
+end
 end
