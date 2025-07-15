@@ -1200,7 +1200,7 @@ def main():
   # --- program hps
   # root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/new-arch'
   # root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/out/ponder-net-replicate'
-  root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/output/ponder-net-retrain'
+  root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/output/ponder-net-retrain'
   # root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/output/ponder-net-single-tick'
   # root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/output/act-with-bottleneck'
   # root_p = '/scratch/naf264/explore-variational-rnn/'
