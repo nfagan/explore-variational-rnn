@@ -75,7 +75,8 @@ ops = {
   'OR':     lambda x, y: int(x or y)
 }
 
-def generate_logic_task_examplar(b0: int, max_num_ops: int, fixed_num_ops = None):
+def generate_logic_task_examplar(
+  b0: int, max_num_ops: int, fixed_num_ops = None, sample_ops_with_replacement = True):
   """
   """
   # 1. Sample the two initial binary numbers.
@@ -91,12 +92,16 @@ def generate_logic_task_examplar(b0: int, max_num_ops: int, fixed_num_ops = None
   # 3. Prepare the 10 chunks of size 10.
   # For the first B chunks, set a one-hot encoding for a randomly chosen operation (index 0 to 9).
   chunks = []
+  curr_ops = []
   for i in range(max_num_ops):
     if i < B:
       op_index = random.randint(0, len(ops_list)-1)
+      if not sample_ops_with_replacement:
+        while op_index in curr_ops: op_index = random.randint(0, len(ops_list)-1)
       one_hot = [0] * 10
       one_hot[op_index] = 1
       chunks.extend(one_hot)
+      curr_ops.append(op_index)
     else:
       # For remaining chunks, append 10 zeros.
       chunks.extend([0] * 10)
@@ -139,7 +144,8 @@ def generate_logic_task_examplar(b0: int, max_num_ops: int, fixed_num_ops = None
   target = b_curr
   return input_vec, target, torch.tensor(intermediates)
 
-def generate_logic_task_sequence(seq_len: int, num_ops: int, fixed_num_ops = None):
+def generate_logic_task_sequence(
+  seq_len: int, num_ops: int, fixed_num_ops = None, sample_ops_with_replacement = True):
   """
   Generate a batch of examples for the ACT logic task.
   
@@ -152,7 +158,7 @@ def generate_logic_task_sequence(seq_len: int, num_ops: int, fixed_num_ops = Non
   intermediates = []
   for i in range(seq_len):
     b0 = random.randint(0, 1) if i == 0 else int(targets[-1][0])
-    inp, tgt, ints = generate_logic_task_examplar(b0, num_ops, fixed_num_ops)
+    inp, tgt, ints = generate_logic_task_examplar(b0, num_ops, fixed_num_ops, sample_ops_with_replacement)
     if i == 0: inp[0] = float(b0)
     inputs.append(inp)
     targets.append([float(tgt)])  # wrap target so that its shape is (1,)

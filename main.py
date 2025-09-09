@@ -10,7 +10,7 @@ from sklearn.pipeline import make_pipeline
 
 from tasks import generate_logic_task_sequence, generate_addition_task_sequence, generate_parity_task_sequence
 
-import os, random, string
+import os, random, string, datetime
 from itertools import product
 from multiprocessing import Process
 from typing import List, Union
@@ -59,7 +59,8 @@ class AdditionDataset(Dataset):
 class LogicDataset(Dataset):
   def __init__(
     self, batch_size: int, seq_len: int, num_ops: int, 
-    num_samples: int = None, fixed_num_ops: int = None, fixed_num_ops_p = None):
+    num_samples: int = None, fixed_num_ops: int = None, fixed_num_ops_p = None, 
+    sample_ops_with_replacement = True):
     """"""
     super().__init__()
     self.batch_size = batch_size
@@ -69,6 +70,7 @@ class LogicDataset(Dataset):
     self.num_samples = num_samples
     self.fixed_num_ops = fixed_num_ops
     self.fixed_num_ops_p = fixed_num_ops_p
+    self.sample_ops_with_replacement = sample_ops_with_replacement
 
     if fixed_num_ops_p is not None:
       assert fixed_num_ops is None, 'Only specify one of `fixed_num_ops` and `fixed_num_ops_p`'
@@ -76,7 +78,8 @@ class LogicDataset(Dataset):
 
     if num_samples is not None:
       for _ in range(num_samples):
-        x, y, _ = generate_logic_task_sequence(self.seq_len, self.num_ops, self.fixed_num_ops)
+        x, y, _ = generate_logic_task_sequence(
+          self.seq_len, self.num_ops, self.fixed_num_ops, self.sample_ops_with_replacement)
         self.samples.append((x, y))
   
   def __len__(self):
@@ -91,10 +94,12 @@ class LogicDataset(Dataset):
 
     elif self.fixed_num_ops_p is not None:
       num_ops = 1 + np.random.choice(self.num_ops, size=(1,), replace=True, p=self.fixed_num_ops_p).item()
-      x, y, intermediates = generate_logic_task_sequence(self.seq_len, self.num_ops, num_ops)
+      x, y, intermediates = generate_logic_task_sequence(
+        self.seq_len, self.num_ops, num_ops, self.sample_ops_with_replacement)
 
     else:
-      x, y, intermediates = generate_logic_task_sequence(self.seq_len, self.num_ops, self.fixed_num_ops)
+      x, y, intermediates = generate_logic_task_sequence(
+        self.seq_len, self.num_ops, self.fixed_num_ops, self.sample_ops_with_replacement)
 
     # x: (seq_len x N) | y: (seq_len x 1) | m: (seq_len x 1)
     y = y.type(torch.long)
@@ -201,6 +206,7 @@ class VRNNClassifier(nn.Module):
     z_hist = []
     m_hist = []
     s_hist = []
+    h_hist = []
 
     nt = torch.zeros((xi.shape[0], 1), dtype=torch.long)
     yt = torch.zeros((xi.shape[0], self.nc))
@@ -227,6 +233,7 @@ class VRNNClassifier(nn.Module):
       y = self.hidden_state_to_output(h)
       lambda_n = torch.sigmoid(self.halt(h))
       if min_lambda_p is not None: lambda_n = torch.maximum(lambda_n, min_lambda_p)
+      # lambda_n = torch.clamp(lambda_n, torch.tensor(0.05), torch.tensor(1.-0.05))
 
       # --- evaluation: store outputs
       # when lambda_n is low, the probability of newly halting should be low      
@@ -248,6 +255,8 @@ class VRNNClassifier(nn.Module):
         z_hist = z.unsqueeze(-1) if n == 0 else torch.cat([z_hist, z.unsqueeze(-1)], dim=-1)
         m_hist = mus.unsqueeze(-1) if n == 0 else torch.cat([m_hist, mus.unsqueeze(-1)], dim=-1)
         s_hist = sigmas.unsqueeze(-1) if n == 0 else torch.cat([s_hist, sigmas.unsqueeze(-1)], dim=-1)
+
+      h_hist.append(h)
 
       newly_halted = torch.logical_and(
         keep_processing, torch.logical_or(
@@ -278,6 +287,8 @@ class VRNNClassifier(nn.Module):
       addtl['zv'] = z_hist
       addtl['mv'] = m_hist
       addtl['sv'] = s_hist
+
+    addtl['h'] = torch.stack(h_hist, dim=-1)
 
     # @TODO: sx should be updated to new hidden state if processing sequential data
 
@@ -615,6 +626,12 @@ def sequence_error_rate(ys: torch.Tensor, yh: torch.Tensor):
   err_rate = torch.mean(err.type(torch.float))
   return err_rate
 
+def compute_entropy(x: torch.Tensor, dim: int) -> torch.Tensor:
+  y = torch.log(x)
+  y[~torch.isfinite(y)] = 0.
+  ent = -torch.sum(x * y, dim=dim)
+  return ent
+
 def p_halt_entropy_comparison(p_halt: torch.Tensor):
   ent_diffs = 0.
   for i in range(len(p_halt)):
@@ -677,63 +694,170 @@ def do_evaluate(enc: Union[RecurrentClassifier, VRNNClassifier], foward_fn, data
     yh = torch.argmax(torch.softmax(y, dim=1), dim=1)
     err_rate = sequence_error_rate(ys, yh)
     seq_acc = sequence_acc(ys, yh)
+
+    ph_dist = None
     if 'p_halt' in addtl:
-      p_halt_rel_entropy = p_halt_entropy_comparison(addtl['p_halt'])
+      ph = addtl['p_halt']
+      assert len(ph) == 1, 'Sequences not yet handled'
+      p_halt_rel_entropy = p_halt_entropy_comparison(ph)
+      ph_dist = torch.mean(ph[0], dim=0).detach().cpu().numpy()
     else:
       p_halt_rel_entropy = float('nan')
+
+    sigmas = None
+    if 'sv' in addtl:
+      sigmas = torch.mean(addtl['sv'][0], dim=[0, 1]).detach().cpu().numpy()
+    mus = None
+    if 'mv' in addtl:
+      mus = torch.mean(addtl['mv'][0], dim=[0, 1]).detach().cpu().numpy()
+
     L, loss_components = loss_fn(y, ys, p, addtl)
+
     res = {
       'acc': seq_acc.item(), 'err_rate': err_rate.item(), 
       'ticks': n.float().mean().item(), 'p_halt_rel_entropy': p_halt_rel_entropy}
+    
+    if ph_dist is not None: res['p_halt_distribution'] = ph_dist
+    if sigmas is not None: res['encoder_sigma'] = sigmas
+    if mus is not None: res['encoder_mu'] = mus
     for src_key_name in loss_components:
       dst_key_name = f'{src_key_name}_loss'
       res[dst_key_name] = loss_components[src_key_name]
+
     return res, addtl
+  
+def logic_task_extract_op_indices(intermediates, last_only=True):
+  num_ops = intermediates[:, :, -1, :][:, -1, -1]
+  op_indices = intermediates[:, :, 0, :]
+  if last_only:
+    op_indices = op_indices[torch.arange(op_indices.shape[0]), num_ops-1, -1]
+  else:
+    op_indices = op_indices[torch.arange(op_indices.shape[0]), :, -1]
+  return op_indices
+
+def decode_internal_reprs_logic_task_alt(
+  enc: Union[RecurrentClassifier, VRNNClassifier], foward_fn, loss_fn, batch_size: int):
+  """"""
+  # --- train classifier
+  num_ops = 10
+  restrict_clfs_within_valid_ticks = False
+
+  def train_clfs():
+    data_prep = prepare_logic_task(batch_size=batch_size, num_ops=num_ops, fixed_num_ops=num_ops, seq_len=1)
+    _, addtl = do_evaluate(enc, foward_fn, data_prep, loss_fn)
+
+    last_ticki = addtl['halted_at'][:, -1]  # last step of sequence
+    hs = addtl['h'][-1]
+    max_t = hs.shape[-1]
+
+    op_indices = logic_task_extract_op_indices(addtl['intermediates'], last_only=False)
+
+    num_ops_eval = num_ops
+    # num_ops_eval = min(num_ops_eval, 4)
+    # max_t = min(max_t, 4)
+
+    clfs = []
+    for oi in range(num_ops_eval):
+      print(f'{oi+1} of {num_ops_eval}')
+      for ti in range(max_t):
+        xs = hs[:, :, ti].detach().cpu().numpy()
+        ys = op_indices[:, oi].detach().cpu().numpy()
+        if restrict_clfs_within_valid_ticks:
+          # don't consider hidden states beyond the final chosen tick
+          m = ti <= last_ticki.detach().cpu().numpy()
+          xs = xs[m, :]
+          ys = ys[m]
+        clf = make_pipeline(StandardScaler(), SGDClassifier(max_iter=1000, tol=1e-3, loss='log_loss'))
+        clf.fit(xs, ys)
+        clfs.append({'oi': oi, 'ti': ti, 'clf': clf})
+    return clfs
+  
+  clfs = train_clfs()
+
+  data_prep = prepare_logic_task(
+  batch_size=1_000, num_ops=num_ops, fixed_num_ops=num_ops, seq_len=1)
+  _, addtl = do_evaluate(enc, foward_fn, data_prep, loss_fn)
+  last_ticki = addtl['halted_at'][:, -1]  # last step of sequence
+  hs = addtl['h'][-1]
+  max_t = hs.shape[-1]
+  op_indices = logic_task_extract_op_indices(addtl['intermediates'], last_only=False)
+
+  ps = np.zeros((max_t, num_ops))
+  for ti in range(max_t):
+    m = ti <= last_ticki
+    if not restrict_clfs_within_valid_ticks: m[:] = True
+    xs = hs[m, :, ti]
+    for oi in range(num_ops):
+      ys = op_indices[m, oi]
+      rel_clf = [*filter(lambda x: x['ti'] == ti and x['oi'] == oi, clfs)]
+      assert len(rel_clf) == 1, 'No classifier matched'      
+      rel_clf = rel_clf[0]['clf']
+      ps[ti, oi] = rel_clf.score(xs.detach().cpu().numpy(), ys.detach().cpu().numpy())
+
+  rd = {'ps': ps}
+  return rd
   
 def decode_internal_reprs_logic_task(
   enc: Union[RecurrentClassifier, VRNNClassifier], foward_fn, loss_fn, batch_size: int):
-  data_prep = prepare_logic_task(batch_size=batch_size, num_ops=10, fixed_num_ops=None)
+  """
+  """
+  num_ops = 10
+  data_prep = prepare_logic_task(batch_size=batch_size, num_ops=num_ops, fixed_num_ops=None, seq_len=1)
   _, addtl = do_evaluate(enc, foward_fn, data_prep, loss_fn)
-  last_ticki = addtl['n'][:, -1]  # last step of sequence
+  last_ticki = addtl['halted_at'][:, -1]  # last step of sequence
   last_h = addtl['h'][-1]
   last_h = last_h[torch.arange(last_h.shape[0]), :, last_ticki]
-
-  num_ops = addtl['intermediates'][:, :, -1, :][:, -1, -1]
-  op_indices = addtl['intermediates'][:, :, 0, :]
-  op_indices = op_indices[torch.arange(op_indices.shape[0]), num_ops-1, -1]
+  op_indices = logic_task_extract_op_indices(addtl['intermediates'])
 
   clfs = []
   clf_ys = [addtl['ys'][:, -1].detach().cpu().numpy(), op_indices.detach().cpu().numpy()]
+  clf_ncs = [enc.nc, num_ops]
   for clf_Y in clf_ys:
-    clf = make_pipeline(StandardScaler(), SGDClassifier(max_iter=1000, tol=1e-3))
+    clf = make_pipeline(StandardScaler(), SGDClassifier(max_iter=1000, tol=1e-3, loss='log_loss'))
     clf_X = last_h.detach().cpu().numpy()
     clf.fit(clf_X, clf_Y)
     clfs.append(clf)
 
-  # now evaluate over ticks
-  data_prep = prepare_logic_task(batch_size=1_000, num_ops=10, fixed_num_ops=None)
+  # now evaluate over ticks, using sequence of operations that does not have duplicates
+  data_prep = prepare_logic_task(
+    batch_size=1_000, num_ops=10, fixed_num_ops=None, seq_len=1, sample_ops_with_replacement=False)
   _, addtl = do_evaluate(enc, foward_fn, data_prep, loss_fn)
   hs = addtl['h']
   nt = max([x.shape[-1] for x in hs])
+  # @TODO:
+  op_indices_test = logic_task_extract_op_indices(addtl['intermediates']).detach().cpu().numpy()
 
   class_pred_ys = []
-  for clf in clfs:
+  class_prob_sets = []
+  for clfi, clf in enumerate(clfs):
+    clf_obj = clf.named_steps['sgdclassifier']
+    # clf_coef = clf_obj.coef_
     class_preds = []
+    class_probs = []
     for si in range(len(hs)):
       hi = hs[si]
       class_pred = torch.ones(hi.shape[0], nt) * -1
+      class_prob = torch.zeros(hi.shape[0], max(clf_ncs), nt)
       for pi in range(hi.shape[2]):
         hp = hi[:, :, pi].detach().cpu().numpy()
         yp = clf.predict(hp)
+        sc = clf.predict_proba(hp)
         class_pred[:, pi] = torch.tensor(yp)
+        class_prob[:, :clf_ncs[clfi], pi] = torch.tensor(sc)
       class_preds.append(class_pred.detach().cpu().numpy())
+      class_probs.append(class_prob.detach().cpu().numpy())
     class_pred_ys.append(np.stack(class_preds, axis=-1))
+    class_prob_sets.append(np.stack(class_probs, axis=-1))
   
   class_pred_ys = np.stack(class_pred_ys, axis=-1)
+  class_prob_sets = np.stack(class_prob_sets, axis=-1)
+
   ints = addtl['intermediates']
   rd = {
     'n': addtl['n'].detach().cpu().numpy(), 
-    'pred_ys': class_pred_ys, 'intermediates': ints.detach().cpu().numpy()}
+    'pred_ys': class_pred_ys, 'intermediates': ints.detach().cpu().numpy(),
+    'class_probs': class_prob_sets
+  }
   return rd
 
 def evaluate_generalization(
@@ -753,11 +877,12 @@ def evaluate_hidden_representations(
   # decode hidden state representation(s) of output
   if hps['task_type'] == 'logic':
     hp_res = {**hps}
-    decode_res = decode_internal_reprs_logic_task(enc, forward_fn, loss_fn, ctx.default_batch_size)
+    # decode_res = decode_internal_reprs_logic_task(enc, forward_fn, loss_fn, ctx.default_batch_size)
+    decode_res = decode_internal_reprs_logic_task_alt(enc, forward_fn, loss_fn, ctx.default_batch_size)
     decode_res['hps'] = fix_dict_for_matfile(hp_res)
     if ctx.do_save:
       matname = GenCPFnameFn(hp_res, True)(train_epoch).replace('.pth', '.mat')
-      savemat(os.path.join(ctx.save_p, 'decoding', matname), decode_res)
+      savemat(os.path.join(ctx.save_p, 'decoding-alt', matname), decode_res)
 
 def evaluate_varying_difficulty(
   ctx: EvaluateContext, enc: RecurrentClassifier, forward_fn, loss_fn, train_epoch: int, hps: dict):
@@ -796,11 +921,11 @@ def evaluate(
   hps['num_fixed_ticks'] = -1
   hps['seq_len'] = 3
 
-  if True: evaluate_baseline(ctx, enc, forward_fn, data, loss_fn, train_epoch, {**hps})
+  # if True: evaluate_baseline(ctx, enc, forward_fn, data, loss_fn, train_epoch, {**hps})
   if True: evaluate_varying_difficulty(ctx, enc, forward_fn, loss_fn, train_epoch, hps)
-  if False: evaluate_generalization(ctx, enc, forward_fn, loss_fn, train_epoch, hps)
-  if False: evaluate_hidden_representations(ctx, enc, forward_fn, loss_fn, train_epoch, hps)
-  if False: evaluate_fixed_ticks(ctx, enc, forward_fn, data, loss_fn, train_epoch, {**hps})
+  # if True: evaluate_hidden_representations(ctx, enc, forward_fn, loss_fn, train_epoch, hps)
+  # if False: evaluate_generalization(ctx, enc, forward_fn, loss_fn, train_epoch, hps)
+  # if False: evaluate_fixed_ticks(ctx, enc, forward_fn, data, loss_fn, train_epoch, {**hps})
 
 def evaluate_baseline(
   ctx: EvaluateContext, enc: RecurrentClassifier, forward_fn, data: DataLoader, 
@@ -817,11 +942,11 @@ def evaluate_baseline(
 
 def prepare_logic_task(
     *, batch_size: int, num_ops: int, fixed_num_ops: int, 
-    seq_len: int = 3, fixed_num_ops_p = None):
+    seq_len: int = 3, fixed_num_ops_p = None, **kwargs):
   """"""
   ds = LogicDataset(
     batch_size=batch_size, seq_len=seq_len, num_ops=num_ops, 
-    num_samples=None, fixed_num_ops=fixed_num_ops, fixed_num_ops_p=fixed_num_ops_p)
+    num_samples=None, fixed_num_ops=fixed_num_ops, fixed_num_ops_p=fixed_num_ops_p, **kwargs)
   return DataLoader(ds, batch_size=batch_size)
 
 def prepare_parity_task(*, batch_size: int, vector_length: int):
@@ -854,6 +979,9 @@ def prepare_data(task_type: str, batch_size: int, task_params: dict):
   else: assert False
 
   return data_train, input_dim, nc
+
+def discrete_uniform_dist(n: int):
+  return torch.ones((n,)) / n
 
 def geometric_dist(n: int, p: float):
   k = (1 + np.arange(n)).astype(np.float64)
@@ -909,14 +1037,20 @@ class TrainCBFn(object):
     self.gen_cp_fname_fn = gen_cp_fname_fn
     self.hps = hps
     self.root_p = root_p
+    self.last_cp_only = cp_save_interval is None
+
+  def get_save_p(self, e: int):
+    # cp_fname = self.gen_cp_fname_fn(e)
+    cp_fname = f'{random_str(8)}.pth'
+    return os.path.join(self.root_p, 'data', cp_fname)
 
   def __call__(self, enc, e: int, num_epochs: int):
     if not self.do_save: return
-    # if e % self.cp_save_interval != 0: return
-    if not (e + 1) == num_epochs: return
-    cp_fname = self.gen_cp_fname_fn(e)
+    is_last = (e + 1) == num_epochs
+    do_save = is_last or ((e % self.cp_save_interval == 0) and not self.last_cp_only)
+    if not do_save: return
     cp = {'state': enc.state_dict(), 'hps': self.hps}
-    torch.save(cp, os.path.join(self.root_p, 'data', cp_fname))
+    torch.save(cp, self.get_save_p(e))
 
 class GravesGenCPFnameFn(object):
   def __init__(self, hps: dict):
@@ -930,7 +1064,7 @@ class GenCPFnameFn(object):
   def __init__(self, hps: dict, eval_mode: bool):
     self.hps = hps
     self.eval_mode = eval_mode
-    self.excl_hps = ['loss_fn_type', 'eps_halting']
+    self.excl_hps = ['loss_fn_type', 'eps_halting', 'ponder_penalty_type', 'explore_weight']
     self.excl_hps_if_none = ['min_lp']
 
   def include_hp(self, k: str) -> bool:
@@ -943,7 +1077,7 @@ class GenCPFnameFn(object):
     res = f'act-checkpoint-{make_cp_id(hp_gen)}-{e}.pth'
     if self.eval_mode:
       res = res[:min(len(res), 128)].replace('.pth', '')
-      res += ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+      res += random_str(8)
       res = f'{res}.pth'
     return res
   
@@ -993,16 +1127,26 @@ class PonderNetLossFn(object):
       lambda_p: float = 0.2,
       ponder_weight: float = 1. * 1e-2,
       accuracy_weight: float = 1.,
-      complexity_weight: float = 1. * 1e-2):
+      complexity_weight: float = 1. * 1e-2,
+      explore_weight: float = 0.,
+      ponder_penalty_type: str = 'kl-geometric',
+      weight_normalization_type: str = 'none'):
     """"""
+    assert ponder_penalty_type in ['kl-geometric', 'expected-ticks']
+    assert weight_normalization_type in ['none', 'divide_sum']
+
     self.disable_ponder_weight = False
     self.last_tick_only = False
+    self.ponder_penalty_type = ponder_penalty_type
+    self.weight_normalization_type = weight_normalization_type
 
     self.lambda_p = torch.tensor(lambda_p)
     self.accuracy_weight = accuracy_weight
     self.ponder_weight = ponder_weight * (1. - self.disable_ponder_weight)
     self.complexity_weight = complexity_weight
+    self.explore_weight = explore_weight
     self.eps = 1e-10
+    self.step = 0
 
   def __call__(self, y, ys, p, addtl: dict):
     T = ys.shape[1] # sequence length
@@ -1010,6 +1154,7 @@ class PonderNetLossFn(object):
     L_ce = torch.tensor(0.)
     L_ponder_prior = torch.tensor(0.)
     L_complexity = torch.tensor(0.)
+    L_explore = torch.tensor(0.)
 
     for t in range(T):
       yi = ys[:, t]
@@ -1018,7 +1163,7 @@ class PonderNetLossFn(object):
       p_halt = addtl['p_halt'][t]
       y_hat = addtl['y'][t]
 
-      # --- accuracy term
+      # --- accuracy term:
       nc = y_hat.shape[1]
       if nc == 1:
         # binary cross entropy
@@ -1042,34 +1187,58 @@ class PonderNetLossFn(object):
 
       L_ce += torch.mean(torch.sum(ce, dim=1))
 
-      # --- prior term: KL-div between halting probabilities and geometric distribution
+      # --- ponder prior term:
       num_halt = halted_at + 1
       max_halt = torch.max(num_halt)
       geo_prior_k = torch.arange(max_halt).unsqueeze(-1).T.repeat(yi.shape[0], 1).type(torch.float32)
-      geo_prior = torch.pow((1 - self.lambda_p), geo_prior_k) * self.lambda_p
-      geo_prior = geo_prior / torch.sum(geo_prior, dim=1, keepdim=True)
 
-      ponder_prior_kl_term = discrete_kl_divergence(p_halt, geo_prior, 1)
-      L_ponder_prior += torch.mean(ponder_prior_kl_term)
+      if self.ponder_penalty_type == 'kl-geometric':
+        # KL-div between halting probabilities and geometric distribution
+        geo_prior = torch.pow((1 - self.lambda_p), geo_prior_k) * self.lambda_p
+        geo_prior = geo_prior / torch.sum(geo_prior, dim=1, keepdim=True)
+        ponder_prior_kl_term = discrete_kl_divergence(p_halt, geo_prior, 1)
+        L_ponder_prior += torch.mean(ponder_prior_kl_term)
+
+      elif self.ponder_penalty_type == 'expected-ticks':
+        # expected # ticks
+        expected_ticks = torch.sum(p_halt * (1. + geo_prior_k), dim=1)
+        L_ponder_prior += torch.mean(expected_ticks)
+
+      else: assert False
+
+      # --- exploitation penalty (KL from uniform):
+      un_dist = discrete_uniform_dist(p_halt.shape[1]).unsqueeze(-1).T.repeat(p_halt.shape[0], 1)
+      uniform_kl = discrete_kl_divergence(p_halt, un_dist, 1)
+      L_explore += torch.mean(uniform_kl)
 
       # --- complexity term: 
       if 'mv' in addtl:
         mus = addtl['mv'][t]
         sigs = addtl['sv'][t]
+        # dim=1 -> mean across latent dimensions, preserving batch and sequence
         kl_iso_gauss = torch.mean(kl_divs_diag_gaussian(mus, sigs), dim=1)
+        # expectation across time steps
         kl_iso_gauss *= p_halt
         L_complexity += torch.mean(torch.sum(kl_iso_gauss, dim=1))
 
     L_ce /= T
     L_ponder_prior /= T
     L_complexity /= T
+    L_explore /= T
 
-    aw, pw, cw = self.accuracy_weight, self.ponder_weight, self.complexity_weight
+    aw, pw, cw, ew = self.accuracy_weight, self.ponder_weight, self.complexity_weight, self.explore_weight
     # total loss
-    L = L_ce*aw + L_ponder_prior*pw + L_complexity*cw
+    L = L_ce*aw + L_ponder_prior*pw + L_complexity*cw + L_explore*ew
+
+    if self.weight_normalization_type == 'divide_sum':
+      weight_sum = aw + pw + cw + ew
+      L /= weight_sum
+    else:
+      assert self.weight_normalization_type == 'none'
 
     components = {
-      'accuracy': L_ce.item(), 'ponder_prior': L_ponder_prior.item(), 'complexity': L_complexity.item()
+      'accuracy': L_ce.item(), 'ponder_prior': L_ponder_prior.item(), 
+      'complexity': L_complexity.item(), 'explore': L_explore.item()
     }
 
     return L, components
@@ -1097,19 +1266,43 @@ class VariationalLossFn(object):
     # return L_acc + ponder_cost*L_ponder + beta*L_kl
     res = weights[0]*L_acc + weights[1]*L_ponder + weights[2]*L_kl
     return res, {}
+  
+def prepare_eval_from_checkpoint(cp: dict, data_train, input_dim: int, nc: int):
+  hps = cp['hps']
+  state = cp['state']
+  # @TODO: Only supporting basic hyperparameter combinations
+  assert hps['model_type'] == 'vrnn'
+  assert hps['loss_fn_type'] == 'ponder-net'
+
+  enc = VRNNClassifier(
+    input_dim=input_dim, hidden_dim=hps['rnn_hidden_dim'],
+    rnn_cell_type=hps['rnn_cell_type'], nc=nc, bottleneck_K=hps['bottleneck_K']
+  )
+  forward_fn = VRNNForwardFn(
+    M=hps['M'], num_fixed_ticks=hps['num_fixed_ticks'], 
+    step_type=hps['step_type'], eps_halting=hps['eps_halting'],
+    min_lambda_p=hps['min_lp'])
+  loss_fn = PonderNetLossFn(
+    complexity_weight=hps['beta'], ponder_weight=hps['ponder_cost'], lambda_p=hps['lp'], 
+    ponder_penalty_type=hps['ponder_penalty_type'], explore_weight=hps['explore_weight'],
+    weight_normalization_type=hps['weight_normalization_type'], accuracy_weight=hps['accuracy_weight'])
+  
+  enc.eval()
+  enc.load_state_dict(state)
+  return enc, forward_fn, loss_fn
 
 def prepare(
   *, ponder_cost: float, do_save: bool, step_type: str, num_fixed_ticks: int, hps: dict,
   data_train: DataLoader, input_dim: int, rnn_hidden_dim: int, 
   nc: int, eval_epoch: int, bottleneck_K: int, beta: float, 
   M: int, weight_normalization_type: str, root_p: str, loss_fn_type: str, 
-  model_type: str, rnn_cell_type: str, eps_halting: float, lambda_p: float, min_lambda_p: float):
+  model_type: str, rnn_cell_type: str, eps_halting: float, lambda_p: float, min_lambda_p: float,
+  ponder_penalty_type: str, explore_weight: float, accuracy_weight: float, cp_save_interval: int):
   """"""
 
   assert model_type in ['rvib', 'vrnn']
   assert loss_fn_type in ['graves', 'variational', 'ponder-net']
 
-  cp_save_interval = 2000
   rnn_hidden_dim = hps['rnn_hidden_dim'] = rnn_hidden_dim
   rnn_cell_type = hps['rnn_cell_type'] = rnn_cell_type
 
@@ -1121,6 +1314,9 @@ def prepare(
   hps['eps_halting'] = eps_halting
   hps['lp'] = lambda_p
   hps['min_lp'] = min_lambda_p
+  hps['ponder_penalty_type'] = ponder_penalty_type
+  hps['explore_weight'] = explore_weight
+  hps['accuracy_weight'] = accuracy_weight
 
   if model_type == 'vrnn':
     enc = VRNNClassifier(
@@ -1159,13 +1355,19 @@ def prepare(
       ponder_cost=ponder_cost, beta=beta, weight_normalization_type=weight_normalization_type
     )
   elif loss_fn_type == 'ponder-net':
-    loss_fn = PonderNetLossFn(complexity_weight=beta, ponder_weight=ponder_cost, lambda_p=lambda_p)
+    loss_fn = PonderNetLossFn(
+      complexity_weight=beta, ponder_weight=ponder_cost, lambda_p=lambda_p, 
+      ponder_penalty_type=ponder_penalty_type, explore_weight=explore_weight,
+      weight_normalization_type=weight_normalization_type, accuracy_weight=accuracy_weight)
   else: assert False
 
   args = (enc, forward_fn, data_train, loss_fn, train_cb_fn, gen_cp_fname_fn)
   return args
 
 # ------------------------------------------------------------------------------------------------
+
+def random_str(n: int) -> str:
+  return ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(n))
 
 def split_array_indices(M: int, N: int) -> List[np.ndarray[int]]:
   # Return indices to split sequence with length `M` into at most `N` disjoint sets
@@ -1183,8 +1385,11 @@ def split_array_indices(M: int, N: int) -> List[np.ndarray[int]]:
   
 def train_set(arg_sets): 
   for args in arg_sets: train(*args)
+
 def eval_set(arg_sets):
-  for args in arg_sets: evaluate(*args)
+  for i, args in enumerate(arg_sets): 
+    print(f'{i+1} of {len(arg_sets)}')
+    evaluate(*args)
 
 def run(set_fn, arg_sets, num_processes: int):
   if num_processes <= 0:
@@ -1196,20 +1401,63 @@ def run(set_fn, arg_sets, num_processes: int):
     for p in processes: p.start()
     for p in processes: p.join()
 
+def find_files_in_directory(d: str):
+  import glob
+  return glob.glob(os.path.join(d, '*'))
+
+def filter_files_by_date(file_paths: List[str], date: datetime, op: str) -> List[str]:
+  """"""
+  assert op in ['gt', 'lt', 'ge', 'le']
+  ops = {'gt': lambda x, y: x > y, 'lt': lambda x, y: x < y,
+         'ge': lambda x, y: x >= y, 'le': lambda x, y: x <= y}
+
+  filtered_files = []
+  cutoff_timestamp = date.timestamp()
+  for path in file_paths:
+    try:
+      if os.path.isfile(path):
+        mtime = os.path.getmtime(path)
+        if ops[op](mtime, cutoff_timestamp):
+          filtered_files.append(path)
+    except OSError:
+      # Skip files that can't be accessed
+      continue  
+  return filtered_files
+
+def prepare_eval_from_directory(
+  cps: List[str], eval_ctx: EvaluateContext, task_type: str, batch_size: int, task_params: dict):
+  """"""
+  
+  arg_sets = []
+  for cp in cps:
+    data_train, input_dim, nc = prepare_data(task_type, batch_size, task_params)
+
+    res = torch.load(cp)
+    enc, forward_fn, loss_fn = prepare_eval_from_checkpoint(res, data_train, input_dim, nc)
+
+    tstamp = str(datetime.datetime.fromtimestamp(os.path.getmtime(cp)))
+    hps = {**res['hps']}
+    hps['epoch'] = -1
+    hps['timestamp'] = tstamp
+    hps['checkpoint_filename'] = os.path.split(cp)[1]
+
+    arg_sets.append((eval_ctx, enc, forward_fn, data_train, loss_fn, -1, hps))
+
+  return arg_sets
+
 def main():
   # --- program hps
-  # root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/new-arch'
-  # root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/out/ponder-net-replicate'
-  root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/output/ponder-net-retrain'
-  # root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/output/ponder-net-single-tick'
-  # root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/experiment/output/act-with-bottleneck'
-  # root_p = '/scratch/naf264/explore-variational-rnn/'
+  # root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/output/ponder-net-manipulate-network-size-mult-cps-large-n'
+  root_p = '/Users/nick/source/mattarlab/explore-variational-rnn/output/ponder-net-simplex'
   do_save = True
+  skip_existing = True
+  dry_run = False
+  evaluate_directory = True
   
-  num_processes = 4
+  num_processes = 5
   replicate_graves = False
   replicate_ponder_net = True
-  do_train = True
+  do_train = False
   if not do_train: num_processes = 0
   task_type = 'logic'
   task_params = {}
@@ -1217,7 +1465,10 @@ def main():
   # --- program hps
 
   # --- network / training hps
+  match_rnn_hidden_dim_to_bottleneck_K = False
+  ponder_penalty_type = 'kl-geometric'
   lambda_p = 0.
+  explore_weight = 0.
   min_lambda_p = None
   eps_halting = 1e-2
   grad_clip = None  # before 6/24/25
@@ -1233,6 +1484,7 @@ def main():
   # rnn_cell_type = 'rnn'
   # rnn_hidden_dim = 2048
 
+  cp_save_interval = 5_000
   train_batch_size = 32
   # eval_batch_size = 10_000
   eval_batch_size = 5_000
@@ -1246,9 +1498,6 @@ def main():
   M = 14
   weight_normalization_type = 'none'
   # weight_normalization_type = 'sums_to_1'
-  # ponder_costs = [1e-3 * 0.5, 1e-3 * 1, 1e-3 * 2, 1e-3 * 3, 1e-3 * 4]
-  # ponder_costs = [1e-3 * 2, 1e-3 * 3, 1e-2]
-  # ponder_costs = [1e-2]
   ponder_costs = [1e-3, 1e-3 * 1.5, 1e-3 * 1.75, 1e-3 * 2]
   ponder_costs = [4e-3]
   # ponder_costs = [1e-3, 16e-3]
@@ -1258,6 +1507,7 @@ def main():
   betas = [1e-3, 1e-2, 1e-3 * 0.5, 1e-2 * 0.5, 1e-2 * 2]
   betas += [0.]
   betas = [1e-3]
+  accuracy_weights = [1.]
   # --- network / training hps
 
   # betas = [0.]
@@ -1265,7 +1515,7 @@ def main():
   seeds = [61, 62, 63, 64, 65]
   # seeds = [seeds[0]]
   # seeds = [62, 63]
-  # seeds = seeds[:3]
+  seeds = seeds[:3]
 
   if not do_train:
     eval_epochs = list(np.arange(0, num_train_epochs, 2_000))
@@ -1285,8 +1535,6 @@ def main():
     bottleneck_Ks = [None]
     betas = [0.]
     train_batch_size = 16
-    # ponder_costs = [1e-3, 1e-2, 1e-1]
-    # ponder_costs = [1e-3, 2e-3, 4e-3, 6e-3, 8e-3]
     ponder_costs = [1e-3, 1e-3*2, 1e-2]
     seeds = [61]
     lr = 1e-4
@@ -1302,9 +1550,7 @@ def main():
   if replicate_ponder_net:
     lambda_p = 0.2
     bottleneck_Ks = [None]
-    # betas = [0.]
     ponder_costs = [1e-2]
-    # seeds = [61]
     train_batch_size = 128
     model_type = 'vrnn'
     loss_fn_type = 'ponder-net'
@@ -1312,13 +1558,12 @@ def main():
     rnn_hidden_dim = 128
     lr = 3e-4
     M = 20
-    # M = 4
-    # task_type = 'parity'
     task_type = 'logic'
     step_type = 'ponder-net'
     eps_halting = 0.05
-    # num_train_epochs = 300_000
+    # num_train_epochs = 250_000
     num_train_epochs = 60_000
+    # num_train_epochs = 100_000
     if not do_train: eval_epochs = [num_train_epochs - 1]
 
     # seeds = seeds[:3]
@@ -1328,35 +1573,79 @@ def main():
       task_params['vector_length'] = 64
 
     elif task_type == 'logic':
+      # seeds = [*range(66, 71)]
+      # seeds = [64, 65]
+
       rnn_hidden_dim = 256
       rnn_cell_type = 'gru'
       task_params['seq_len'] = 1
       # make harder examples moderately more likely
       task_params['fixed_num_ops_p'] = np.flip(geometric_dist(10, 0.3))
       bottleneck_Ks = [rnn_hidden_dim]
+      # bottleneck_Ks = [64, 128, 256]
+      # bottleneck_Ks = [512]
       betas = [0., 1e-3, 2e-3, 5e-3, 1e-2, 5e-2]
       # betas = [0.]
       lambda_p = 0.2
-      # min_lambda_p = 1. # force only a single tick
       # ponder_costs = [1e-2 * 2., 1e-2 * 4.]
-      # ponder_costs = [1e-2*1, 1e-2*2, 1e-2*3, 1e-2*4]
-      ponder_costs = [1e-1]
+      # ponder_costs = [1e-2*1, 1e-2*2, 1e-2*3, 1e-2*4, 1e-1]
+      ponder_costs = [1e-2*1, 1e-2*3, 1e-1]
+      # ponder_costs = [0., 5e-1]
+      ponder_costs = [1.]
       betas = betas[:4]
 
-      # betas = betas[:1]
-      # ponder_costs = ponder_costs[:1]
+      betas = [1e-4]
+      ponder_costs = [1e-2, 3e-2, 1e-1, 5e-1, 1.]
+
+      match_rnn_hidden_dim_to_bottleneck_K = True
+
+      # --- simplex
+      weight_normalization_type = 'divide_sum'
+      accuracy_weights = sorted([1., 0.95, 0.8, 0.5, 1e-2, 1e-3])
+      # --- end
+
+      # --- single tick
+      if False:
+        min_lambda_p = 1. # force only a single tick
+        ponder_costs = [0.]
+        betas = [0.]
+        bottleneck_Ks = [256, 512, 1024]
+        seeds = seeds[:3]
+      # --- end single tick
+
+      # ponder_penalty_type = 'expected-ticks'
+      # explore_weight = 1.
+      # betas = [0.]
+      # ponder_costs = [1e-4]
       # seeds = seeds[:1]
       # assert False
 
   # --- override params for replication
+  if not do_train:
+    eval_epochs = [*np.arange(0, num_train_epochs, cp_save_interval), num_train_epochs-1]
 
-  its = [*product(seeds, eval_epochs, ponder_costs, betas, bottleneck_Ks)]
+    if evaluate_directory:
+      eval_d = os.path.join(root_p, 'data')
+      cp_fs = find_files_in_directory(eval_d)
+      if True:
+        # cutoff = datetime.datetime(2025, 9, 2)
+        cutoff = datetime.datetime(2025, 9, 8)
+        cp_fs = filter_files_by_date(cp_fs, cutoff, 'lt')
+      if False: # @TODO
+        cp_fs = filter_files_by_epoch(cp_fs, num_train_epochs-1)
+      eval_ctx = EvaluateContext(
+        save_p=os.path.join(root_p, 'results'), do_save=do_save, default_batch_size=eval_batch_size)
+      arg_sets = prepare_eval_from_directory(cp_fs, eval_ctx, task_type, eval_batch_size, task_params)
+      run(eval_set, arg_sets, num_processes)
+      return
+
+  its = [*product(seeds, eval_epochs, ponder_costs, betas, accuracy_weights, bottleneck_Ks)]
   arg_sets = []
 
   for i, it in enumerate(its):
     print(f'{i+1} of {len(its)}')
 
-    seed, eval_epoch, ponder_cost, beta, bottleneck_K = it
+    seed, eval_epoch, ponder_cost, beta, accuracy_weight, bottleneck_K = it
     hps = {}
 
     hps['task_type'] = task_type
@@ -1370,16 +1659,27 @@ def main():
     batch_size = train_batch_size if eval_epoch is None else eval_batch_size
     data_train, input_dim, nc = prepare_data(task_type, batch_size, task_params)
 
-    enc, forward_fn, data_train, loss_fn, train_cb_fn, gen_cp_fname_fn = prepare(
+    rnn_hd = rnn_hidden_dim
+    if match_rnn_hidden_dim_to_bottleneck_K: rnn_hd = bottleneck_K
+
+    enc, forward_fn, data_train, loss_fn, train_cb_fn, _ = prepare(
       ponder_cost=ponder_cost, do_save=do_save,
       step_type=step_type, num_fixed_ticks=num_fixed_ticks, hps=hps,
       data_train=data_train, nc=nc, 
-      input_dim=input_dim, rnn_hidden_dim=rnn_hidden_dim, eval_epoch=eval_epoch,
+      input_dim=input_dim, rnn_hidden_dim=rnn_hd, eval_epoch=eval_epoch,
       bottleneck_K=bottleneck_K, beta=beta, M=M, 
       weight_normalization_type=weight_normalization_type, root_p=root_p,
       loss_fn_type=loss_fn_type, model_type=model_type, rnn_cell_type=rnn_cell_type,
-      eps_halting=eps_halting, lambda_p=lambda_p, min_lambda_p=min_lambda_p
+      eps_halting=eps_halting, lambda_p=lambda_p, min_lambda_p=min_lambda_p,
+      ponder_penalty_type=ponder_penalty_type, explore_weight=explore_weight, 
+      accuracy_weight=accuracy_weight, cp_save_interval=cp_save_interval
     )
+
+    if do_train and skip_existing:
+      last_cp_f = train_cb_fn.get_save_p(num_train_epochs - 1)
+      if os.path.exists(os.path.join(root_p, last_cp_f)): 
+        print(f'Skipping: {last_cp_f}')
+        continue
 
     if eval_epoch is not None:
       # evaluate
@@ -1394,7 +1694,10 @@ def main():
         num_train_epochs, lr, seed, grad_clip))
 
   set_fn = train_set if eval_epoch is None else eval_set
-  run(set_fn, arg_sets, num_processes)
+  if not dry_run:
+    run(set_fn, arg_sets, num_processes)
+  else:
+    print(f'Would run with: {len(arg_sets)} combinations')
 
 # ------------------------------------------------------------------------------------------------
 
